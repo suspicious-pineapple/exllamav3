@@ -34,7 +34,8 @@ def generate_single(generator, tokenizer):
         stop_conditions = get_stop_conditions(prompt_format, tokenizer),
         max_new_tokens = 500,
         completion_only = True,
-        add_bos = True
+        encode_special_tokens = True,
+        # add_bos = True,
     )
     print("Response: " + response)
     print()
@@ -66,7 +67,7 @@ def generate_streaming(generator, tokenizer):
     # Create the job and enqueue it
     formatted_prompt = format_prompt(prompt_format, system_prompt, instruction)
     job = Job(
-        input_ids = tokenizer.encode(formatted_prompt, add_bos = True),
+        input_ids = tokenizer.encode(formatted_prompt, add_bos = True, encode_special_tokens = True),
         max_new_tokens = 400,
         stop_conditions = get_stop_conditions(prompt_format, tokenizer),
     )
@@ -105,7 +106,7 @@ def generate_streaming_batched(generator, tokenizer):
         # be any object, but a simple index will work here
         formatted_prompt = format_prompt(prompt_format, system_prompt, instruction)
         job = Job(
-            input_ids = tokenizer.encode(formatted_prompt, add_bos = True),
+            input_ids = tokenizer.encode(formatted_prompt, add_bos = True, encode_special_tokens = True),
             max_new_tokens = 400,
             stop_conditions = get_stop_conditions(prompt_format, tokenizer),
             identifier = idx,

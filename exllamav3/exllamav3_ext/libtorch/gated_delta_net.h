@@ -2,6 +2,7 @@
 
 #include <ATen/Tensor.h>
 #include <vector>
+#include <memory>
 #include <pybind11/pybind11.h>
 namespace py = pybind11;
 #include "linear.h"
@@ -98,23 +99,16 @@ struct BC_GatedDeltaNet
 };
 
 
-// Split-projection variant (Qwen3.5: in_proj_qkv/in_proj_z/in_proj_b/in_proj_a). Runs the whole
-// GDN layer for a single decode token in one call, replayed via an internal CUDA graph after the
-// second invocation. b/a projections are merged into one fp16 GEMV at construction
-
+// Split-projection variant (Qwen3.5: in_proj_qkv/in_proj_z/in_proj_b/in_proj_a). b/a projections
+// are merged into one fp16 GEMV at construction.
+//
+// Split-projection GDN, generalized over (bsz, seqlen) up to MAX_BSZ x MAX_QLEN and over
+// save_history (captured graph is tied to a specific history-branch kernel). Each (bsz, seqlen)
+// shape gets its own lazily-configured Slot with exact-size scratch statics
 struct BC_GatedDeltaNetSplit
 {
-    // Preallocated bsz-1 scratch buffers (shared between layers via the python tensor cache)
-    at::Tensor qkv;               // (1, 1, F) float
-    at::Tensor z;                 // (1, 1, Nv, Hv) float
-    at::Tensor ba;                // (1, 1, 2*Nv) float
-    at::Tensor beta;              // (1, 1, Nv) bfloat16
-    at::Tensor g;                 // (1, 1, Nv) float
-    at::Tensor mixed_qkv;         // (1, F, 1) bfloat16
-    at::Tensor conv_out;          // (1, 1, F) bfloat16
-    at::Tensor core_attn_out;     // (1, 1, Nv, Hv) bfloat16
-    at::Tensor core_attn_out_f;   // (1, 1, Nv*Hv) half
-    at::Tensor z_flat;            // (1, 1, Nv*Hv) view of z
+    static constexpr int MAX_BSZ = 8;
+    static constexpr int MAX_QLEN = 16;
 
     std::shared_ptr<BC_LinearEXL3> qkv_proj;
     std::shared_ptr<BC_LinearEXL3> z_proj;
@@ -132,21 +126,80 @@ struct BC_GatedDeltaNetSplit
     std::shared_ptr<BC_GatedRMSNorm> norm;
     const float beta_scale;
 
-    Graph graph_bsz1;
-    int graph_state_size;
-    int graph_hist_stride;
+    // Sliced qkv+z bundle (exl3_mgemm sliced mode, see attention.h): both projections read x,
+    // cut into equal-width column slices and run as ONE launch when R <= 32. Meta (CPU int32,
+    // 5 x slices): target (0 qkv, 1 z), column offset, width, row stride, source. Outputs are
+    // fp32 (the projections' out dtype), so the carrier is fp32
+    c10::optional<at::Tensor> qkvz_ptrs_trellis, qkvz_ptrs_suh, qkvz_ptrs_svh, qkvz_meta;
+    float qkvz_K = 0;
+    bool qkvz_mcg = false;
+    bool qkvz_mul1 = false;
+    at::Tensor qkvz_size_n, qkvz_n_stride, qkvz_had_src, qkvz_carrier;
+    void set_qkvz_bundle
+    (
+        at::Tensor ptrs_trellis,
+        at::Tensor ptrs_suh,
+        at::Tensor ptrs_svh,
+        at::Tensor meta,
+        float K,
+        bool mcg,
+        bool mul1
+    );
+
+    // KDA mode (GLM5.3): b/f_a/g_a fp16 GEMVs off x, low-rank f_b/g_b second stages, per-
+    // k-channel decay ("safe gate" when lower_bound != 0), sigmoid-gated norm (z = g_b out)
+    bool kda = false;
+    float lower_bound = 0.0f;
+    at::Tensor b_weight_t;        // (Nv, hidden) half
+    at::Tensor f_a_weight_t;      // (Hk, hidden) half
+    at::Tensor f_b_weight_t;      // (Nv*Hk, Hk) half
+    at::Tensor g_a_weight_t;      // (Hv, hidden) half
+    at::Tensor g_b_weight_t;      // (Nv*Hv, Hv) half
+
+    struct Slot
+    {
+        bool configured = false;
+
+        // Per-shape statics (python tensor cache), exact-sized for this slot's (bsz, seqlen)
+        at::Tensor qkv;               // (bsz, seqlen, F) float
+        at::Tensor z;                 // (bsz, seqlen, Nv, Hv) float
+        at::Tensor z_flat;            // (bsz, seqlen, Nv*Hv) view of z
+        at::Tensor ba;                // (bsz, seqlen, 2*Nv) float
+        at::Tensor beta;              // (bsz, seqlen, Nv) bfloat16
+        at::Tensor g;                 // (bsz, seqlen, Nv) float; KDA: (bsz, seqlen, Nv, Hk)
+        at::Tensor mixed_qkv;         // (bsz, F, seqlen) bfloat16
+        at::Tensor conv_out;          // (bsz, seqlen, F) bfloat16
+        at::Tensor core_attn_out;     // (bsz, seqlen, Nv, Hv) bfloat16
+        at::Tensor core_attn_out_f;   // (bsz, seqlen, Nv*Hv) half
+
+        // KDA intermediates
+        at::Tensor b_out;             // (bsz, seqlen, Nv) float
+        at::Tensor fa_out;            // (bsz, seqlen, Hk) float
+        at::Tensor fb_out;            // (bsz, seqlen, Nv*Hk) float
+        at::Tensor ga_out;            // (bsz, seqlen, Hv) float
+
+        // Hadamard scratch for the bypassed exl3_gemm_gr calls (qkv_proj/z_proj/o_proj), shaped
+        // like each projection's own input
+        at::Tensor qkv_xh, z_xh, o_xh;
+        at::Tensor qkvz_c_ptrs, qkvz_xh;   // sliced qkv+z bundle: per-slice output pointers, (2, R, hidden) scratch
+
+        // State-buffer geometry baked into this slot's captured graph (scalar kernel args can't
+        // be patched): set on the slot's first eager run, checked before every replay
+        int graph_state_size = -1;
+        int graph_hist_stride = -1;
+        // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
+        // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
+        // another cache reconfigures (and recaptures)
+        int64_t stage_key = 0;
+
+        std::unique_ptr<Graph> graph;
+    };
+    std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
+    std::vector<Slot> slots_hist;   // history == true
+
 
     BC_GatedDeltaNetSplit
     (
-        at::Tensor _qkv,
-        at::Tensor _z,
-        at::Tensor _ba,
-        at::Tensor _beta,
-        at::Tensor _g,
-        at::Tensor _mixed_qkv,
-        at::Tensor _conv_out,
-        at::Tensor _core_attn_out,
-        at::Tensor _core_attn_out_f,
         std::shared_ptr<BC_LinearEXL3> _qkv_proj,
         std::shared_ptr<BC_LinearEXL3> _z_proj,
         std::shared_ptr<BC_LinearEXL3> _o_proj,
@@ -163,15 +216,6 @@ struct BC_GatedDeltaNetSplit
         std::shared_ptr<BC_GatedRMSNorm> _norm,
         const float _beta_scale
     ) :
-        qkv             (std::move(_qkv)),
-        z               (std::move(_z)),
-        ba              (std::move(_ba)),
-        beta            (std::move(_beta)),
-        g               (std::move(_g)),
-        mixed_qkv       (std::move(_mixed_qkv)),
-        conv_out        (std::move(_conv_out)),
-        core_attn_out   (std::move(_core_attn_out)),
-        core_attn_out_f (std::move(_core_attn_out_f)),
         qkv_proj        (_qkv_proj),
         z_proj          (_z_proj),
         o_proj          (_o_proj),
@@ -186,52 +230,146 @@ struct BC_GatedDeltaNetSplit
         conv1d_weight   (std::move(_conv1d_weight)),
         conv1d_bias     (std::move(_conv1d_bias)),
         norm            (_norm),
-        beta_scale      (_beta_scale),
-        graph_state_size(-1),
-        graph_hist_stride(-1)
+        beta_scale      (_beta_scale)
     {
-        z_flat = z.view({1, 1, -1});
+        slots.resize(MAX_BSZ * MAX_QLEN);
+        slots_hist.resize(MAX_BSZ * MAX_QLEN);
     }
 
-    void run_bsz1_gr
+    Slot& slot(int bsz, int seqlen, bool history)
+    {
+        std::vector<Slot>& v = history ? slots_hist : slots;
+        return v[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+    }
+
+    // KDA-mode constructor
+    BC_GatedDeltaNetSplit
+    (
+        std::shared_ptr<BC_LinearEXL3> _qkv_proj,
+        std::shared_ptr<BC_LinearEXL3> _o_proj,
+        at::Tensor _b_weight_t,
+        at::Tensor _f_a_weight_t,
+        at::Tensor _f_b_weight_t,
+        at::Tensor _g_a_weight_t,
+        at::Tensor _g_b_weight_t,
+        at::Tensor _dt_bias,
+        at::Tensor _a_log,
+        float _lower_bound,
+        int _num_k_heads,
+        int _num_v_heads,
+        int _k_head_dim,
+        int _v_head_dim,
+        at::Tensor _conv1d_weight,
+        c10::optional<at::Tensor> _conv1d_bias,
+        std::shared_ptr<BC_GatedRMSNorm> _norm,
+        const float _beta_scale
+    ) :
+        qkv_proj        (_qkv_proj),
+        z_proj          (nullptr),
+        o_proj          (_o_proj),
+        dt_bias         (std::move(_dt_bias)),
+        a_log           (std::move(_a_log)),
+        num_k_heads     (_num_k_heads),
+        num_v_heads     (_num_v_heads),
+        k_head_dim      (_k_head_dim),
+        v_head_dim      (_v_head_dim),
+        conv1d_weight   (std::move(_conv1d_weight)),
+        conv1d_bias     (std::move(_conv1d_bias)),
+        norm            (_norm),
+        beta_scale      (_beta_scale),
+        kda             (true),
+        lower_bound     (_lower_bound),
+        b_weight_t      (std::move(_b_weight_t)),
+        f_a_weight_t    (std::move(_f_a_weight_t)),
+        f_b_weight_t    (std::move(_f_b_weight_t)),
+        g_a_weight_t    (std::move(_g_a_weight_t)),
+        g_b_weight_t    (std::move(_g_b_weight_t))
+    {
+        slots.resize(MAX_BSZ * MAX_QLEN);
+        slots_hist.resize(MAX_BSZ * MAX_QLEN);
+    }
+
+    bool needs_configure(int bsz, int seqlen, bool history, int64_t stage_key = 0);
+    void set_stage_key(int bsz, int seqlen, bool history, int64_t stage_key) { slot(bsz, seqlen, history).stage_key = stage_key; }
+
+    void configure_slot_kda
+    (
+        int bsz,
+        int seqlen,
+        bool history,
+        at::Tensor qkv,
+        at::Tensor z,
+        at::Tensor b_out,
+        at::Tensor fa_out,
+        at::Tensor fb_out,
+        at::Tensor ga_out,
+        at::Tensor beta,
+        at::Tensor g,
+        at::Tensor mixed_qkv,
+        at::Tensor conv_out,
+        at::Tensor core_attn_out,
+        at::Tensor core_attn_out_f,
+        at::Tensor qkv_xh,
+        at::Tensor o_xh
+    );
+
+    void configure_slot
+    (
+        int bsz,
+        int seqlen,
+        bool history,
+        at::Tensor qkv,
+        at::Tensor z,
+        at::Tensor ba,
+        at::Tensor beta,
+        at::Tensor g,
+        at::Tensor mixed_qkv,
+        at::Tensor conv_out,
+        at::Tensor core_attn_out,
+        at::Tensor core_attn_out_f,
+        at::Tensor qkv_xh,
+        at::Tensor z_xh,
+        at::Tensor o_xh
+    );
+
+    void run_bszN_gr
+    (
+        const at::Tensor& x,
+        at::Tensor& y,
+        at::Tensor& conv_state,
+        at::Tensor& recurrent_state,
+        const at::Tensor& slots,            // conv ring rows (cache slots)
+        const at::Tensor& slots_scan,       // recurrent-state pool rows the scan writes
+        bool history,
+        const c10::optional<at::Tensor>& slots_in,   // pool rows a speculative pass starts from
+        Slot& s,
+        Graph* graph
+    );
+
+    void run_bszN
     (
         const at::Tensor& x,
         at::Tensor& y,
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
-        Graph* graph
-    );
-
-    void run_bsz1
-    (
-        const at::Tensor& x,
-        at::Tensor& y,
-        at::Tensor& conv_state,
-        at::Tensor& recurrent_state,
-        const at::Tensor& slots
+        const at::Tensor& slots_scan,
+        bool history,
+        const c10::optional<at::Tensor>& slots_in
     );
 };
 
 
-// Mamba2 (NemotronH): whole layer for a single decode token, replayed via an internal CUDA
-// graph. in_proj -> [z, xBC, dt] split -> conv1d -> SSD recurrence -> grouped gated norm ->
-// o_proj. Padded projection dims (hidden % 128 != 0) stage through zero-padded statics like
-// BC_Attention: x copies into xp at the graph head, the padded o_proj output trims into y at
-// the tail
-
+// Mamba2 (NemotronH): in_proj -> [z, xBC, dt] split -> conv1d -> SSD recurrence -> grouped gated
+// norm -> o_proj.
+//
+// Mamba2 (NemotronH), generalized over (bsz, seqlen), see BC_GatedDeltaNetSplit above. Padded
+// projection dims (hidden % 128 != 0) stage through per-slot zero-padded statics like BC_Attention:
+// x copies into xp at the graph head, the padded o_proj output trims into y at the tail
 struct BC_Mamba2
 {
-    // Statics (python tensor cache, shared between layers of the same shape)
-    c10::optional<at::Tensor> xp;   // (1, K_padded) half, zero-padded input staging (padded in_proj only)
-    at::Tensor proj;                // (1, 1, N_padded) float, in_proj output
-    at::Tensor mixed_xbc;           // (1, F, 1) bfloat16, conv input
-    at::Tensor dt;                  // (1, 1, H) bfloat16
-    at::Tensor g;                   // (1, 1, H) float
-    at::Tensor conv_out;            // (1, 1, F) bfloat16
-    at::Tensor core_attn_out;       // (1, 1, H, Hv) bfloat16
-    at::Tensor core_attn_out_f;     // (1, 1, H*Hv) half
-    c10::optional<at::Tensor> yp;   // (1, No_padded) o_dtype, padded o_proj output (padded o only)
+    static constexpr int MAX_BSZ = 8;
+    static constexpr int MAX_QLEN = 16;
 
     std::shared_ptr<BC_LinearEXL3> in_proj;
     std::shared_ptr<BC_LinearEXL3> o_proj;
@@ -249,28 +387,51 @@ struct BC_Mamba2
     at::Tensor conv1d_weight;       // (F, K) bfloat16
     c10::optional<at::Tensor> conv1d_bias;
     std::shared_ptr<BC_GatedRMSNorm> norm;
-
-    // Views
-    at::Tensor z_gate;              // (1, 1, groups, gs) float view of proj[.., :v_dim]
-    at::Tensor core_g;              // (1, 1, groups, gs) view of core_attn_out
-    at::Tensor core_f_g;            // (1, 1, groups, gs) view of core_attn_out_f
     int v_dim;
+    bool padded_in;                 // in_proj K padded (hidden_size != in_proj->K)
+    bool padded_out;                // o_proj N padded (hidden_size != o_proj->N)
 
-    Graph graph_bsz1;
-    int graph_state_size;
-    int graph_hist_stride;
+    struct Slot
+    {
+        bool configured = false;
+
+        c10::optional<at::Tensor> xp;   // (R, K_padded) half, zero-padded input staging
+        at::Tensor proj;                // (bsz, seqlen, N_padded) float, in_proj output
+        at::Tensor mixed_xbc;           // (bsz, F, seqlen) bfloat16, conv input
+        at::Tensor dt;                  // (bsz, seqlen, H) bfloat16
+        at::Tensor g;                   // (bsz, seqlen, H) float
+        at::Tensor conv_out;            // (bsz, seqlen, F) bfloat16
+        at::Tensor core_attn_out;       // (bsz, seqlen, H, Hv) bfloat16
+        at::Tensor core_attn_out_f;     // (bsz, seqlen, H*Hv) half
+        c10::optional<at::Tensor> yp;   // (R, No_padded) o_dtype, padded o_proj output
+
+        // z_gate is its own contiguous buffer, NOT a narrow()+view() of proj: proj's row stride
+        // is N_padded (> v_dim), so such a view has gaps between rows once bsz*seqlen > 1 that
+        // gated_rms_norm_kernel's raw rows*dim indexing silently misreads. mamba2_fused_op_gr
+        // writes a real contiguous copy of proj[.., :v_dim] into it instead
+        at::Tensor z_gate;              // (bsz, seqlen, groups, gs) float, contiguous
+        at::Tensor core_g;              // (bsz, seqlen, groups, gs) view of core_attn_out (contiguous, safe)
+        at::Tensor core_f_g;            // (bsz, seqlen, groups, gs) view of core_attn_out_f (contiguous, safe)
+
+        // Hadamard scratch for the bypassed exl3_gemm_gr calls (in_proj/o_proj)
+        at::Tensor in_xh, o_xh;
+
+        // Per-slot state geometry snapshot (see BC_GatedDeltaNetSplit::Slot)
+        int graph_state_size = -1;
+        int graph_hist_stride = -1;
+        // Speculative-pass slots: the conv_out/beta/g statics view one cache's staged scan-input
+        // buffers (the rewind replays from them), so the slot is bound to that cache; a pass for
+        // another cache reconfigures (and recaptures)
+        int64_t stage_key = 0;
+
+        std::unique_ptr<Graph> graph;
+    };
+    std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
+    std::vector<Slot> slots_hist;   // history == true
+
 
     BC_Mamba2
     (
-        c10::optional<at::Tensor> _xp,
-        at::Tensor _proj,
-        at::Tensor _mixed_xbc,
-        at::Tensor _dt,
-        at::Tensor _g,
-        at::Tensor _conv_out,
-        at::Tensor _core_attn_out,
-        at::Tensor _core_attn_out_f,
-        c10::optional<at::Tensor> _yp,
         std::shared_ptr<BC_LinearEXL3> _in_proj,
         std::shared_ptr<BC_LinearEXL3> _o_proj,
         at::Tensor _dt_bias,
@@ -286,17 +447,10 @@ struct BC_Mamba2
         at::Tensor _conv1d_weight,
         c10::optional<at::Tensor> _conv1d_bias,
         std::shared_ptr<BC_GatedRMSNorm> _norm,
+        bool _padded_in,
+        bool _padded_out,
         int _dt_first = 0
     ) :
-        xp              (std::move(_xp)),
-        proj            (std::move(_proj)),
-        mixed_xbc       (std::move(_mixed_xbc)),
-        dt              (std::move(_dt)),
-        g               (std::move(_g)),
-        conv_out        (std::move(_conv_out)),
-        core_attn_out   (std::move(_core_attn_out)),
-        core_attn_out_f (std::move(_core_attn_out_f)),
-        yp              (std::move(_yp)),
         in_proj         (_in_proj),
         o_proj          (_o_proj),
         dt_bias         (std::move(_dt_bias)),
@@ -312,33 +466,66 @@ struct BC_Mamba2
         conv1d_weight   (std::move(_conv1d_weight)),
         conv1d_bias     (std::move(_conv1d_bias)),
         norm            (_norm),
-        dt_first        (_dt_first),
-        graph_state_size(-1),
-        graph_hist_stride(-1)
+        padded_in       (_padded_in),
+        padded_out      (_padded_out),
+        dt_first        (_dt_first)
     {
         v_dim = num_v_heads * v_head_dim;
-        int gs = v_dim / num_k_heads;
-        z_gate = proj.narrow(2, 0, v_dim).view({1, 1, num_k_heads, gs});
-        core_g = core_attn_out.view({1, 1, num_k_heads, gs});
-        core_f_g = core_attn_out_f.view({1, 1, num_k_heads, gs});
+        slots.resize(MAX_BSZ * MAX_QLEN);
+        slots_hist.resize(MAX_BSZ * MAX_QLEN);
     }
 
-    void run_bsz1_gr
+    Slot& slot(int bsz, int seqlen, bool history)
+    {
+        std::vector<Slot>& v = history ? slots_hist : slots;
+        return v[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+    }
+
+    bool needs_configure(int bsz, int seqlen, bool history, int64_t stage_key = 0);
+    void set_stage_key(int bsz, int seqlen, bool history, int64_t stage_key) { slot(bsz, seqlen, history).stage_key = stage_key; }
+
+    void configure_slot
+    (
+        int bsz,
+        int seqlen,
+        bool history,
+        c10::optional<at::Tensor> xp,
+        at::Tensor proj,
+        at::Tensor mixed_xbc,
+        at::Tensor dt,
+        at::Tensor g,
+        at::Tensor z_gate,
+        at::Tensor conv_out,
+        at::Tensor core_attn_out,
+        at::Tensor core_attn_out_f,
+        c10::optional<at::Tensor> yp,
+        at::Tensor in_xh,
+        at::Tensor o_xh
+    );
+
+    void run_bszN_gr
+    (
+        const at::Tensor& x,
+        at::Tensor& y,
+        at::Tensor& conv_state,
+        at::Tensor& recurrent_state,
+        const at::Tensor& slots,            // conv ring rows (cache slots)
+        const at::Tensor& slots_scan,       // recurrent-state pool rows the scan writes
+        bool history,
+        const c10::optional<at::Tensor>& slots_in,   // pool rows a speculative pass starts from
+        Slot& s,
+        Graph* graph
+    );
+
+    void run_bszN
     (
         const at::Tensor& x,
         at::Tensor& y,
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
-        Graph* graph
-    );
-
-    void run_bsz1
-    (
-        const at::Tensor& x,
-        at::Tensor& y,
-        at::Tensor& conv_state,
-        at::Tensor& recurrent_state,
-        const at::Tensor& slots
+        const at::Tensor& slots_scan,
+        bool history,
+        const c10::optional<at::Tensor>& slots_in
     );
 };

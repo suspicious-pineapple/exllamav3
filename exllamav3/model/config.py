@@ -1,6 +1,8 @@
 from __future__ import annotations
 from abc import ABC
 import os, json
+import torch
+from ..util.backend import INT8_GEMV_MODE
 from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
@@ -27,18 +29,63 @@ class InferParams:
         # only when a single matrix is wide enough to fill the GPU on its own (and K is within the
         # int8 gate); narrow same-input pairs stay fused, where batching is what restores
         # utilization. Only pairs the int8 path can take (mul1 codebook) are ever unfused
-        if int(os.environ.get("EXL3_INT8_GEMV", 2)) > 0:
+        # (the int8 mode is off by default on ROCm, see exl3_gemv_int8.cu)
+        if INT8_GEMV_MODE > 0:
             self.mgemm_K_threshold = int(os.environ.get("EXL3_MGEMM_K_THRESHOLD", 6))
             self.mgemm_n_threshold = int(os.environ.get("EXL3_MGEMM_N_THRESHOLD", 8192))
+        self.mgemm_K_env = "EXL3_MGEMM_K_THRESHOLD" in os.environ
+        # Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU
+        # (weights in system RAM). Layer-split mode only. Budgets and counters are per component
+        # ("text" for the main model; other components, e.g. an MTP head sharing this config, use
+        # the draft budget), and each component gets its own worker process so late-loading
+        # components never race an already-started worker
+        self.moe_cpu_offload = int(os.environ.get("EXL3_MOE_CPU_OFFLOAD", 0))
+        self.draft_moe_cpu_offload = 0
+        self.moe_cpu_offload_assigned = {}
+        # Experimental: per-layer expert split — run the TAIL N routed experts of every
+        # eligible block-sparse MoE layer on the CPU worker instead of whole layers, so the
+        # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
+        # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
+        self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        self.moe_cpu_component = "text"
+        # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
+        # (see moe_cpu_host.MoeCpuTuning)
+        self.moe_cpu_threads = None
+        self.draft_moe_cpu_threads = None
+        # Store the vision component's linear-layer weights (fp16 weight or EXL3 trellis) in
+        # pinned host memory instead of VRAM, computing straight from a zero-copy device alias.
+        # Set before loading the vision component
+        self.vision_pinned = os.environ.get("EXL3_VISION_PINNED", "0") != "0"
+        # Stream an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) from disk with
+        # per-forward row gathers instead of loading the whole table into system RAM (tens of
+        # GB). Set before loading the model
+        self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Hold the n-gram table in RAM (implies ngram_stream_from_disk = False) and mlock() it there, so the kernel
+        # can neither swap it out nor reclaim it (a swapped row costs a page-in inside the forward). Linux; needs
+        # RLIMIT_MEMLOCK to cover the table or CAP_IPC_LOCK. Set before loading the model
+        self.ngram_lock = os.environ.get("EXL3_NGRAM_LOCK", "0") != "0"
+        # Stream the token embedding table from disk with per-forward row gathers instead of
+        # holding it in system RAM. Works for quantized and unquantized tables. Set before
+        # loading the model
+        self.embed_stream_from_disk = os.environ.get("EXL3_EMBED_STREAM", "0") != "0"
 
-    def use_mgemm(self, K: int, out_features: int, mul1: bool = False) -> bool:
+    def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which
         # requires the mul1 codebook; other tensors always keep the fused MGEMM
         if not mul1:
             return True
         # Fuse when K is at/above the bitrate threshold (int8 GEMV can't take those anyway) or the
-        # matrices are too narrow for separate GEMV calls to fill the GPU
-        return K >= self.mgemm_K_threshold or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
+        # matrices are too narrow for separate GEMV calls to fill the GPU. The default threshold
+        # follows the int8 kernel's per-arch K cap (Hopper takes K = 6 as well, issue #242), unless
+        # EXL3_MGEMM_K_THRESHOLD pins it explicitly
+        K_thr = self.mgemm_K_threshold
+        if K_thr and not self.mgemm_K_env and device is not None:
+            import torch
+            device = torch.device(device)
+            if device.type == "cuda" and device.index is not None:
+                from ..ext import exllamav3_ext as ext
+                K_thr = ext.exl3_gemv_int8_max_k(device.index) + 1
+        return K >= K_thr or (self.mgemm_n_threshold > 0 and out_features < self.mgemm_n_threshold)
 
 
 class NullConfig:
@@ -99,6 +146,8 @@ class Config(ABC):
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)
         self.eos_token_id = self.read_cfg([int, list], ["eos_token_id", "text_config->eos_token_id"], None)
         self.pad_token_id = self.read_cfg(int, ["pad_token_id", "text_config->pad_token_id"], None)
+        # Placeholder token a multimodal prompt carries in place of each image (older configs: image_token_index)
+        self.image_token_id = self.read_cfg(int, ["image_token_id", "image_token_index"], None)
         self.vocab_size = self.read_cfg(int, ["vocab_size", "text_config->vocab_size"], None)
         if isinstance(self.eos_token_id, list):
             self.eos_token_id_list = self.eos_token_id
@@ -118,7 +167,14 @@ class Config(ABC):
         self.num_q_heads = -1
         self.num_kv_heads = -1
         self.pos_encoding_mode = "NONE"
-        self.max_position_embeddings = self.read_cfg(int, "max_position_embeddings", self.default_max_position_embeddings())
+        # Multimodal configs keep the text model's limit under text_config (Qwen3.5/3.8, Gemma4,
+        # Mistral3, GLM-4v/5, Muse, Step3.7 ...); the RoPE settings already read the nested dict,
+        # this keeps the public value in step with them
+        self.max_position_embeddings = self.read_cfg(
+            int,
+            ["max_position_embeddings", "text_config->max_position_embeddings"],
+            self.default_max_position_embeddings()
+        )
 
         # Main RoPE module (for MRoPE, individual attn layers have their own modules)
         self.g_rope = None
@@ -227,7 +283,8 @@ class Config(ABC):
         config_dict: dict | None = None,
         theta_key: str | list = None,
         override_type: str = None,
-        override_head_dim: int | None = None
+        override_head_dim: int | None = None,
+        yarn_mscale_ratio: bool = False
     ):
         if config_dict is None:
             config_dict = self.config_dict
@@ -256,7 +313,8 @@ class Config(ABC):
             max_position_embeddings = read_dict(config_dict, int, "max_position_embeddings", None),
             original_max_position_embeddings = read_dict(config_dict, int, "original_max_position_embeddings", None),
             rope_style = rope_style,
-            override_type = override_type
+            override_type = override_type,
+            yarn_mscale_ratio = yarn_mscale_ratio
         )
 
 

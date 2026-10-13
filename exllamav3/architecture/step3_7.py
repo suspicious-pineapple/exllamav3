@@ -119,7 +119,6 @@ class Step3_7Config(Config):
         self.vision.base_grid = self.vision.image_size // self.vision.patch_size
 
         self.projector_bias = self.read_cfg(bool, "projector_bias", False)
-        self.image_token_id = self.read_cfg(int, "image_token_id", None)
         self.im_start_token = self.read_cfg(str, "im_start_token", "<im_start>")
         self.im_end_token = self.read_cfg(str, "im_end_token", "<im_end>")
         self.im_patch_token = self.read_cfg(str, "im_patch_token", "<im_patch>")
@@ -169,7 +168,7 @@ class Step3_7VisionModel(Model):
     ):
         super().__init__(config, **kwargs)
         self.config = config
-        self.caps.update({"image_input": True})
+        self.caps.update({"image_input": True, "default_vision_bits": 6})
 
         if not config.stc.has_tensor(f"{key_prefix}.conv1.weight"):
             key_prefix = "vision_model"

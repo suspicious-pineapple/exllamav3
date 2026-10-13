@@ -37,6 +37,13 @@ __global__ void softcap_h_kernel
 {
     uint64_t idx = ((uint64_t)blockIdx.x * NUM_THREADS + (uint64_t)threadIdx.x) * 2;
     if (idx >= numel) return;
+    if (idx + 1 >= numel)
+    {
+        // Odd numel: the last element has no pair partner
+        float v = __half2float(x[idx]);
+        y[idx] = __float2half_rn(tanhf(v / scale) * scale);
+        return;
+    }
 
     half2 v01 = *((half2*)(x + idx));
     float v0 = __low2float(v01);
@@ -67,6 +74,10 @@ void softcap
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     uint64_t numel = x.numel();
+    TORCH_CHECK(x.dtype() == at::kFloat || x.dtype() == at::kHalf, "softcap wrong dtype");
+    TORCH_CHECK(y.dtype() == x.dtype() && (uint64_t) y.numel() == numel, "softcap: y must match x's dtype and size");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "softcap: x and y must be contiguous");
+    if (!numel) return;
 
     if (x.dtype() == at::kFloat)
     {
@@ -81,7 +92,7 @@ void softcap
     }
     else if (x.dtype() == at::kHalf)
     {
-        softcap_h_kernel<<<CEIL_DIVIDE(numel / 2, NUM_THREADS), NUM_THREADS, 0, stream>>>
+        softcap_h_kernel<<<CEIL_DIVIDE(CEIL_DIVIDE(numel, 2), NUM_THREADS), NUM_THREADS, 0, stream>>>
         (
             (const half*) x.data_ptr(),
             (half*) y.data_ptr(),

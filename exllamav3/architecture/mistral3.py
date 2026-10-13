@@ -35,6 +35,16 @@ class Mistral3Config(Config):
         directory: str,
         **kwargs,
     ):
+        # Mistral-Small-4 shares the Mistral3ForConditionalGeneration wrapper (same Pixtral
+        # tower and projector) around an MLA + MoE text stack; dispatch on the text model_type
+        with open(os.path.join(directory, "config.json"), encoding = "utf8") as f:
+            text_model_type = json.load(f).get("text_config", {}).get("model_type")
+        if text_model_type == "mistral4":
+            from .mistral4 import mistral4_init_config
+            mistral4_init_config(self, directory, **kwargs)
+            self._read_vision_config()
+            return
+
         super().__init__(
             directory,
             {"text": Mistral3Model, "vision": Mistral3VisionModel},
@@ -65,7 +75,13 @@ class Mistral3Config(Config):
         text_cfg = self.read_cfg(dict, "text_config", no_default)
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX, config_dict = text_cfg)
 
-        # Vision model settings
+        self._read_vision_config()
+
+
+    def _read_vision_config(self):
+        """Vision tower / projector / preprocessor settings, shared between the mistral text
+        stack and the mistral4 (MLA + MoE) text stack. Requires rms_norm_eps to be set."""
+
         def unpack_patch_size(patch_temp: dict | int):
             if isinstance(patch_temp, dict):
                 h, w = (patch_temp.get(x) for x in ["height", "width"])
@@ -126,7 +142,8 @@ class Mistral3Config(Config):
 
         # New style:  model.language_model.embed_tokens.weight
         # Old style:  language_model.model.embed_tokens.weight
-        self.new_key_style = self.stc.has_tensor("model.language_model.embed_tokens.weight")
+        self.new_key_style = any(
+            self.stc.has_tensor(f"model.language_model.embed_tokens.{t}") for t in ("weight", "trellis"))
 
 class Mistral3Model(Model):
     config_class = Mistral3Config
@@ -365,7 +382,7 @@ class Mistral3VisionModel(Model):
                 key_up = "linear_1",
                 key_down = "linear_2",
                 hidden_size = config.vision.hidden_size,
-                intermediate_size = 5120,  # This seems to be hard coded?
+                intermediate_size = config.hidden_size,
                 out_size = config.hidden_size,
                 activation_fn = "gelu",
                 qmap = "block",

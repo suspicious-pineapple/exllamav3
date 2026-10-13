@@ -1,4 +1,5 @@
 import sys, os
+from functools import partial
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -6,6 +7,7 @@ from pathlib import Path
 import tempfile
 import webbrowser
 from exllamav3 import Generator, Job, model_init
+from exllamav3.constants import PAGE_SIZE
 from chat_templates import *
 from chat_util import *
 from chat_io import *
@@ -45,16 +47,6 @@ def main(args):
     assert not (args.think and args.no_think), "Cannot enable think and no_think modes at the same time"
     save_probs = args.probs
 
-    if args.basic_console:
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_basic
-    elif args.mode == "gptoss":
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_harmony
-    else:
-        read_input_fn = read_input_ptk
-        streamer_cm = Streamer_rich
-
     # Prompt format
     prompt_format = prompt_formats[args.mode](user_name, bot_name)
     spc = {}
@@ -64,9 +56,29 @@ def main(args):
     system_prompt = prompt_format.default_system_prompt(think) if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
 
+    # Console
+    if args.basic_console:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_basic
+    elif prompt_format.is_harmony_like():
+        read_input_fn = read_input_ptk
+        streamer_cm = partial(Streamer_harmony, tags = prompt_format.harmony_tags())
+    else:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_rich
+
     # Load model
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
     context_length = cache.max_num_tokens
+
+    # Limit max_response_tokens if cache_size is too small
+    if max_response_tokens > context_length // 2:
+        max_response_tokens = context_length // 2
+        print_error(
+            f" !! --max_response_tokens {args.max_response_tokens} leaves no room in the cache "
+            f"({context_length} tokens) for the system prompt and user messages. Reducing max response "
+            f"tokens to {max_response_tokens}."
+        )
 
     # Generator
     generator = Generator(
@@ -77,9 +89,16 @@ def main(args):
         draft_cache = draft_cache,
         num_draft_tokens = args.num_draft_tokens,
         ngram_match_min = args.ngram_match_min,
+        hybrid_draft_tokens = args.hybrid_draft_tokens,
+        ngram_corpus = args.ngram_corpus,
         dynamic_draft_tokens = args.dynamic_draft,
-        dynamic_draft_skip_ema = args.draft_skip_ema,
+        draft_confidence = args.draft_confidence,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
+        show_visualizer = args.visualize_cache,
+        max_chunk_size = args.generator_chunk_size,
     )
+    vra_last = None   # previous /vra report, for the delta column
     stop_conditions = [sc for sc in prompt_format.stop_conditions(tokenizer) if sc]
     if config.eos_token_id_list and all(config.eos_token_id_list):
         stop_conditions += config.eos_token_id_list
@@ -120,6 +139,7 @@ def main(args):
                 user_prompt = "/x"
 
         # Intercept commands
+        num_completions = 1
         en_dis = { True: "Enabled", False: "Disabled" }
         if user_prompt.startswith("/"):
             c = user_prompt.strip().split(" ")
@@ -135,9 +155,13 @@ def main(args):
                         "/cc <n>            Copy nth-last code block to clipboard",
                         "/clear             Clear context",
                         "/e                 Edit and resume last model response",
+                        "/gm                Generator metrics",
                         "/load              Load stored session from ~/chat_py_session.json",
                         "/load <filename>   Load stored session from file",
                         "/mli               Toggle multiline input",
+                        "/n <num> <prompt>  Generate <num> completions to <prompt> (streams first completion)",
+                        "/nihs <num>        Insert an approximately <num> token long needle-in-haystack prompt",
+                        "/ppt               Print page table",
                         "/probs             Set number of probs recorded (0 to disable), adds overhead",
                         "/python            Extract and run the longest code block in a bwrap sandbox",
                         "/r                 Rewind and repeat last prompt",
@@ -149,6 +173,7 @@ def main(args):
                         "/t                 Tokenize context",
                         "/think             Toggle reasoning mode",
                         "/tps               Toggle tokens/second output",
+                        "/vra               VRAM accounting per device, with deltas since the previous /vra",
                         "/x                 Exit",
                     ]))
                     continue
@@ -228,6 +253,9 @@ def main(args):
 
                 # Edit last response
                 case "/e":
+                    if len(context) == 0:
+                        print_error(f"Context is empty, nothing to edit")
+                        continue
                     print_info("Press Alt-Enter to submit")
                     user_prompt = context[-1][0]
                     last_reply = context[-1][-1]
@@ -238,6 +266,30 @@ def main(args):
                     except KeyboardInterrupt:
                         print_info("Exiting")
                         break
+
+                # Generator metrics
+                case "/gm":
+                    m = f"Page table: {generator.pagetable.metrics}"
+                    if generator.cpu_page_cache is not None:
+                        cpc = generator.cpu_page_cache
+                        m += f"\nCPU cache: {cpc.metrics}"
+                        m += f"\nCPU cache pages: {len(cpc)} / {cpc.max_slots} ({cpc.slot_size / 1024 ** 2:.2f} MB/page)"
+                    print_info(m)
+                    continue
+
+                # Page table/cache
+                case "/ppt":
+                    print_info(generator.pagetable.dump_page_list())
+                    continue
+
+                # VRAM accounting (with deltas against the previous /vra)
+                case "/vra":
+                    from exllamav3.util.memory import vram_accounting, format_vram_report
+                    vra_now = vram_accounting(model, cache, generator)
+                    print()
+                    print(format_vram_report(vra_now, previous = vra_last))
+                    vra_last = vra_now
+                    continue
 
                 # Edit system prompt
                 case "/sp":
@@ -282,8 +334,8 @@ def main(args):
                 case "/save_ids":
                     if last_input_ids is None:
                         print_error(f"No IDs to save")
-                    else:
-                        d = {"ids": last_input_ids}
+                        continue
+                    d = {"ids": last_input_ids}
                     save_file(d, "last_ids.safetensors")
                     print_info(f"Saved IDs to last_ids.safetensors")
                     continue
@@ -363,16 +415,16 @@ def main(args):
                 case "/load":
                     if len(c) == 1:
                         c.append("~/chat_py_session.json")
-                        try:
-                            (
-                                system_prompt,
-                                banned_strings,
-                                context
-                            ) = load_session(c[1])
-                            print_info(f"Loaded session from: {c[1]}")
-                        except:
-                            print_error(f"Error loading {c[1]}")
-                        continue
+                    try:
+                        (
+                            system_prompt,
+                            banned_strings,
+                            context
+                        ) = load_session(c[1])
+                        print_info(f"Loaded session from: {c[1]}")
+                    except:
+                        print_error(f"Error loading {c[1]}")
+                    continue
 
                 # Print token IDs for last response
                 case "/t":
@@ -399,6 +451,23 @@ def main(args):
                         print_error("Invalid argument")
                     continue
 
+                # Multiple completions test
+                case "/n":
+                    num_completions = int(c[1]) if len(c) > 1 else 1
+                    user_prompt = " ".join(c[2:])
+
+                # Needle in haystack prompt
+                case "/nihs":
+                    if len(c) != 2 or not c[1].isnumeric() or int(c[1]) < 1:
+                        print_error("Usage: /nihs <num tokens>")
+                        continue
+                    target_tokens = int(c[1])
+                    if target_tokens > context_length:
+                        print_error(f"Requested length exceeds the {context_length}-token cache size")
+                        continue
+                    user_prompt, ref_value, best_tokens = make_haystack_prompt(target_tokens, tokenizer)
+                    print_info(f"Generated {best_tokens}-token needle-in-haystack prompt, reference answer: {ref_value}")
+
                 case _:
                     print_error(f"Unknown command: {c[0]}")
                     continue
@@ -411,22 +480,40 @@ def main(args):
             frm_context = prompt_format.format(system_prompt, context, think)
             if _prefix:
                 frm_context += prefix
-            elif think and prompt_format.thinktag()[0] is not None:
+            elif think and prompt_format.thinktag()[0] is not None and prompt_format.inject_thinktag():
                 frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
             return ids_, exp_len_
 
+        def fits(_exp_len):
+            # The job occupies whole cache pages
+            return (_exp_len + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE <= context_length
+
         ids, exp_len = get_input_ids(prefix)
-        if exp_len > context_length:
-            while exp_len > context_length - 2 * max_response_tokens:
+        if not fits(exp_len):
+            # Drop about a third of the cache for hysteresis, then round by round in case that isn't
+            # enough for a long user prompt
+            start_len = ids.shape[-1]
+            while len(context) > 1 and start_len - ids.shape[-1] < context_length // 3:
                 context = context[1:]
                 ids, exp_len = get_input_ids(prefix)
+            while not fits(exp_len) and len(context) > 1:
+                context = context[1:]
+                ids, exp_len = get_input_ids(prefix)
+            if not fits(exp_len):
+                print_error(
+                    f" !! Prompt needs {exp_len} tokens of cache (including {max_response_tokens} "
+                    f"reserved for the response) but only {context_length} are available. Increase "
+                    f"--cache_size or reduce --max_response_tokens."
+                )
+                context = context[:-1]
+                continue
 
         last_input_ids = ids.clone()
 
         # Inference
-        job = Job(
+        jobs = [Job(
             input_ids = ids,
             max_new_tokens =  max_response_tokens,
             stop_conditions = stop_conditions,
@@ -435,11 +522,14 @@ def main(args):
             token_healing = enable_healing,
             return_logits = save_probs > 0,
             stop_on_loop = (args.loop_window, args.loop_min_reps),
-        )
-        generator.enqueue(job)
+            identifier = n,
+        ) for n in range(num_completions)]
+        generator.enqueue(jobs)
         saved_topk = []
         saved_probs = []
         saved_samples = []
+
+        completions = ["" for _ in range(num_completions)]
 
         # Stream response
         stop_reason = None
@@ -451,7 +541,11 @@ def main(args):
                 s.stream(prefix)
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
+                    bid = r.get("identifier", None)
+                    if bid is None: continue
                     chunk = r.get("text", "")
+                    completions[bid] += chunk
+                    if bid != 0: continue
                     s.stream(chunk)
                     token_ids = r.get("token_ids")
                     if save_probs and "logits" in r:
@@ -466,13 +560,16 @@ def main(args):
                         ids = torch.cat((ids, token_ids), dim = -1)
                     if r["eos"]:
                         stop_reason = r["eos_reason"]
+                        if generator.num_remaining_jobs():
+                            print_info("Completions pending")
 
                 # Check for keypress while streaming
                 keypress = keyreader.getkey()
                 match keypress:
                     case "\x1b":
                         print(f"\n\n{col_error} !! Aborted.{col_default}")
-                        generator.cancel(job)
+                        for job in jobs:
+                            generator.cancel(job)
                         r = None
                         break
 
@@ -512,6 +609,11 @@ def main(args):
             pprint(r, compact = True, indent = 4)
             print()
 
+        if num_completions > 1:
+            for i in range(num_completions):
+                print_info(f"Completion {i+1} / {num_completions}")
+                print("\n" + completions[i])
+
         # Add response to context
         response = s.all_text.strip()
 
@@ -534,7 +636,14 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, cache = True, add_sampling_args = True, add_draft_model_args = True, default_cache_size = 32768)
+    model_init.add_args(
+        parser,
+        cache = True,
+        add_sampling_args = True,
+        add_draft_model_args = True,
+        default_cache_size = 32768,
+        default_autosplit_max_batch_size = 1
+    )
     parser.add_argument("-mode", "--mode", type = str, help = "Prompt mode", default = None)
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
@@ -556,5 +665,7 @@ if __name__ == "__main__":
     parser.add_argument("-ups", "--updates-per-second", type = int, help = "Max number of console updates per second (markdown console), default: 30", default = 30)
     parser.add_argument("-lw", "--loop_window", type = int, help = "Loop detection window in tokens, default = 300", default = 300)
     parser.add_argument("-lmr", "--loop_min_reps", type = int, help = "Min. reps to detect, default = 3", default = 3)
+    parser.add_argument("-vis", "--visualize_cache", action = "store_true", help = "Show cache visualizer (slow)")
+    parser.add_argument("-gcs", "--generator_chunk_size", type = int, default = 2048, help = "Maximum prompt-prefill chunk size, default = 2048")
     _args = parser.parse_args()
     main(_args)

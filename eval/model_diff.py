@@ -36,7 +36,7 @@ def save_tensor(tensor, path: str, tensor_name: str = None):
 def get_dataset_text(spec: dict):
     assert spec["dataset"] == "wiki2", "Only wiki2 implemented atm"
     dataset_text = "\n\n".join(
-        load_dataset("wikitext", "wikitext-2-raw-v1", split = "test")
+        load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split = "test")
         ["text"]
     )
     return dataset_text
@@ -95,7 +95,7 @@ def main(args):
     if args.cache_quant is not None:
         split = [int(bits) for bits in args.cache_quant.split(",")]
         if len(split) == 1:
-            sim_kvq = split + split
+            sim_kvq = tuple(split) + tuple(split)
         elif len(split) == 2:
             sim_kvq = tuple(split)
         else:
@@ -144,6 +144,15 @@ def main(args):
     save_logits_a = []
     save_logits_b = []
 
+    params_a = [{} for _ in range(len(states_a))]
+    params_b = [{} for _ in range(len(states_b))]
+
+    # Architecture-specific input preparation, as Model.forward does before the module chain:
+    # positions for attention, and e.g. the token ids DeepSeek-V4's hash-routed MoE layers need
+    for b in range(len(states_a)):
+        states_a[b] = model_a.prepare_inputs(states_a[b], params_a[b])
+        states_b[b] = model_b.prepare_inputs(states_b[b], params_b[b])
+
     # Inference
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
@@ -170,6 +179,8 @@ def main(args):
         logprob_count = [0, 0]
         kl_div_sum_ab = 0
         kl_div_sum_ba = 0
+        kl_ab_toks = []      # per-token KLD (A, B), for median/quantile statistics
+        conf_b_toks = []     # reference top-token probability per token, for bucketed KLD
         topk_hits_sum = [[0] * topk_max, [0] * topk_max]
         topk_hits_count = [[0] * topk_max, [0] * topk_max]
         topk_agreement_sum = [0] * topk_max
@@ -182,13 +193,18 @@ def main(args):
             state_b = states_b[b]
             eval_ids = all_eval_ids[b]
 
-            params_a = {"sim_kvq": sim_kvq}
-            state_a = module_a.prepare_for_device(state_a, params_a)
-            state_a = module_a.forward(state_a, params_a)
+            params_a[b].update({"sim_kvq": sim_kvq})
+            params_a[b]["dev_cache"] = None
+            # Modules may hand back a view of a shared g_tensor_cache workspace (e.g. the
+            # hyperconnection head's collapsed state): both models on one device would alias the
+            # same buffer and later transients would overwrite it, so the harness keeps its own copy
+            state_a = module_a.prepare_for_device(state_a, params_a[b])
+            state_a = module_a.forward(state_a, params_a[b]).clone()
 
-            params_b = {}
-            state_b = module_b.prepare_for_device(state_b, params_b)
-            state_b = module_b.forward(state_b, params_b)
+            params_b[b].update({})
+            params_b[b]["dev_cache"] = None
+            state_b = module_b.prepare_for_device(state_b, params_b[b])
+            state_b = module_b.forward(state_b, params_b[b]).clone()
 
             # Optionally override model A state for first layers
             if idx < args.keep_b:
@@ -210,8 +226,10 @@ def main(args):
             if not logits_layer:
                 rows = state_a.shape[0]
                 for j in range(rows):
-                    sa = state_a[j].to(float)
-                    sb = state_b[j].to(float)
+                    # Hyperconnection models carry the residual as (seq, streams, hidden): compare
+                    # the streams flattened to rows, the Frobenius norm needs 2D
+                    sa = state_a[j].reshape(-1, state_a.shape[-1]).to(float)
+                    sb = state_b[j].reshape(-1, state_b.shape[-1]).to(float)
                     cos_error_sum += cosine_error(sa, sb)
                     sqnr_sum += sqnr(sa, sb)
                     sa -= sb
@@ -256,8 +274,17 @@ def main(args):
                         topk_agreement_count[t] += top_slice_a.shape[0]
 
                     kl_vocab_size = min(vocab_size, x[0].shape[-1], x[1].shape[-1])
-                    kl_div_sum_ab += compute_kl_div(x[0], x[1], kl_vocab_size).mean().item()
+                    kl_ab = compute_kl_div(x[0], x[1], kl_vocab_size)
+                    kl_div_sum_ab += kl_ab.mean().item()
                     kl_div_sum_ba += compute_kl_div(x[1], x[0], kl_vocab_size).mean().item()
+
+                    # Per-token KLD and reference confidence. The mean KLD is dominated by
+                    # tokens where the reference itself is undecided
+                    kl_ab_toks.append(kl_ab.flatten().float().cpu())
+                    logits_b2 = x[1].view(-1, x[1].shape[-1])
+                    for cf_a in range(0, logits_b2.shape[0], 256):
+                        cf = logits_b2[cf_a:cf_a + 256, :kl_vocab_size].float()
+                        conf_b_toks.append((cf.max(dim = -1).values - cf.logsumexp(dim = -1)).exp().cpu())
 
         # Print error
         if not logits_layer:
@@ -276,10 +303,10 @@ def main(args):
         if logits_layer:
             if args.save_logits_a:
                 print(f" -- Saving model A logits to: {args.save_logits_a}")
-                save_tensor(state_a, args.save_logits_a, "logits")
+                save_tensor(save_logits_a, args.save_logits_a, "logits")
             if args.save_logits_b:
                 print(f" -- Saving model B logits to: {args.save_logits_b}")
-                save_tensor(state_b, args.save_logits_b, "logits")
+                save_tensor(save_logits_b, args.save_logits_b, "logits")
 
         # Final ppl, kld
         if logits_layer:
@@ -319,6 +346,22 @@ def main(args):
     # KLD, either way around
     print(f" -- KL divergence (A, B): {kl_div_ab:11.8f}")
     print(f" -- KL divergence (B, A): {kl_div_ba:11.8f}")
+
+    # Robust per-token statistics
+    kl_ab_all = torch.cat(kl_ab_toks)
+    conf_b_all = torch.cat(conf_b_toks)
+    print(f" -- KL divergence (A, B), per-token: median {kl_ab_all.median().item():.8f}   p90 {kl_ab_all.quantile(0.9).item():.8f}")
+    print(f" -- KL divergence (A, B), by reference confidence:")
+    for c_lo, c_hi in [(0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 0.95), (0.95, 1.01)]:
+        mask = (conf_b_all >= c_lo) & (conf_b_all < c_hi)
+        n = mask.sum().item()
+        if n == 0:
+            continue
+        kb = kl_ab_all[mask]
+        print(
+            f"      B top-prob [{c_lo:4.2f}, {min(c_hi, 1.0):4.2f}): {100 * n / conf_b_all.numel():5.1f}% of tokens"
+            f"   mean {kb.mean().item():.6f}   median {kb.median().item():.6f}"
+        )
 
     return kl_div_ab
 

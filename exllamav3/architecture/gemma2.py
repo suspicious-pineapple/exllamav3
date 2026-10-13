@@ -96,7 +96,8 @@ class Gemma2Model(Model):
                     rope_settings = config.rope_settings,
                     sm_scale = config.query_pre_attn_scalar ** (-0.5),
                     logit_softcapping = config.attn_logit_softcapping,
-                    sliding_window = config.sliding_window if not bool(idx % 2) else -1,
+                    # HF mask keeps sliding_window including the query
+                    sliding_window = config.sliding_window - 1 if not bool(idx % 2) else -1,
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
@@ -174,7 +175,7 @@ class Gemma2Model(Model):
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
         p = "<bos><start_of_turn>user\n"
         if system_prompt:
-            p += "{system_prompt}\n\n"
+            p += f"{system_prompt}\n\n"
         p += f"{prompt}\n"
         p += f"<start_of_turn>model\n"
         return p

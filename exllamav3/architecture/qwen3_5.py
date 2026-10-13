@@ -26,7 +26,8 @@ from .qwen3_5_mtp import Qwen3_5MTPModel, Qwen3_5MoeMTPModel
 
 
 def read_qwen3_5_layer_types(config: Config, text_config_path: str, num_layers: int, full_attention_interval: int) -> list[str]:
-    layer_types = config.read_cfg(list, f"{text_config_path}->layer_types", None)
+    key = f"{text_config_path}->layer_types" if text_config_path else "layer_types"
+    layer_types = config.read_cfg(list, key, None)
     if layer_types is not None:
         assert len(layer_types) == num_layers, \
             "Length of text_config->layer_types key doesn't match number of hidden layers"
@@ -125,7 +126,7 @@ class Qwen3_5VLBaseConfig(Config):
         self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
         self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
         if self.mtp_num_hidden_layers == 0:
-            del self.model_classes["mtp"]
+            self.model_classes.pop("mtp", None)   # only registered by the configs that pass an mtp_model
 
 
 class Qwen3_5VLConfig(Qwen3_5VLBaseConfig):
@@ -251,7 +252,7 @@ class Qwen3_5VLMoeBaseConfig(Config):
         self.mtp_num_hidden_layers = self.read_cfg(int, pfx("mtp_num_hidden_layers"), 0)
         self.mtp_use_dedicated_embeddings = self.read_cfg(bool, pfx("mtp_use_dedicated_embeddings"), False)
         if self.mtp_num_hidden_layers == 0:
-            del self.model_classes["mtp"]
+            self.model_classes.pop("mtp", None)   # only registered by the configs that pass an mtp_model
 
         assert not self.mtp_use_dedicated_embeddings, "MTP dedicated embeddings not currently supported"
 

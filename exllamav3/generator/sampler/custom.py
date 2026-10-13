@@ -10,6 +10,7 @@ from ...util.tensor import buffered_arange
 import random
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from ...util import profile_opt
 import torch.nn.functional as F
 
@@ -44,6 +45,7 @@ class SamplingState:
     probs: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     past_ids: torch.Tensor | None = None
+    tokenizer: Tokenizer | None = None
     state: SS = SS.INIT
     # Logit mask deferred into the fused kernel (fused-only stacks); fused_dim bounds the vocab
     # scan and doubles as the -inf padding of a mask narrower than the logits
@@ -100,10 +102,10 @@ class SS_Argmax(SS_Base):
                 state.sample = torch.argmax(state.probs, dim = -1)
             case SS.LOGITS_S:
                 temp = torch.argmax(state.logits, dim = -1)
-                state.sample = state.indices[temp]
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
             case SS.PROBS_S | SS.PROBS_N_S:
                 temp = torch.argmax(state.probs, dim = -1)
-                state.sample = state.indices[temp]
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
         state.state = SS.DONE
 
 
@@ -112,7 +114,6 @@ class SS_Sample(SS_Base):
     Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
     """
     def run(self, state: SamplingState):
-        # TODO: Fused Gumbel noise + argmax kernel
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits)
@@ -141,8 +142,11 @@ class SS_Sample_mn(SS_Sample):
     """
     def run(self, state: SamplingState):
         match state.state:
-            case SS.PROBS_N_S | SS.PROBS_N:
+            case SS.PROBS_N:
                 state.sample = torch.multinomial(state.probs, num_samples = 1)
+            case SS.PROBS_N_S:
+                temp = torch.multinomial(state.probs, num_samples = 1)
+                state.sample = state.indices.gather(-1, temp)
             case _:
                 raise ValueError("Sampling logic error")
         state.state = SS.DONE
@@ -171,8 +175,15 @@ class SS_Fused(SS_Base):
     keeps a top segment of the same ordering. The threshold is found from a deterministic
     fixed-point histogram of the logits (counts for top-K, exp-mass for top-P, normalized over
     the top-K-truncated set), with boundary buckets refined to 1/32768 nat -- finer than fp16
-    ULP, so the kept set matches the exact sort-based truncation for fp16 logits. Tokens tied
-    exactly at a cutoff are all kept rather than truncated in sort order.
+    ULP, so the kept set matches the exact sort-based truncation for fp16 logits, except at ties
+    and in the far tail:
+
+    - top-K: tokens tied exactly at the cutoff are all kept rather than truncated in sort order.
+      Tokens 32 nats or more below the max (at the filter temperature, relative weight below
+      e^-32) are not ordered: when the cutoff falls among them they are dropped, so fewer than
+      top_k tokens remain.
+    - top-P: the token crossing the cumulative mass is dropped together with every token tied
+      with it (sort-order truncation drops only the crossing token and keeps its earlier ties).
 
     Produced by CustomSampler's stack collapse; equivalent to the steps it replaces (same
     Gumbel noise stream for a given rand_u32, up to rounding at exact ties).
@@ -243,9 +254,11 @@ class SS_Fused(SS_Base):
                 self.histograms[ws_key] = histogram
 
         state.sample = state.empty_sample()
+        mask_is_bits = state.fused_mask is not None and state.fused_mask.dtype == torch.int32
         ext.fused_sampler(
             logits,
-            state.fused_mask,
+            None if mask_is_bits else state.fused_mask,
+            state.fused_mask if mask_is_bits else None,
             state.sample,
             workspace,
             state.fused_dim or state.dim,
@@ -453,7 +466,7 @@ class SS_TopK(SS_Base):
 class SS_TopP(SS_Base):
     """
     Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remainig tokens
+    remaining tokens
     """
     def __init__(self, top_p: float):
         self.top_p = top_p
@@ -518,6 +531,218 @@ class SS_MinP(SS_Base):
 
     def alt(self):
         if self.min_p == 0.0:
+            return SS_NoOp()
+        return None
+
+
+class TokenMask:
+    """
+    Boolean mask over the vocabulary selecting a fixed set of token IDs with per device and
+    vocabulary size caching.
+    """
+    def __init__(self, token_ids):
+        self.token_ids = sorted({int(t) for t in token_ids})
+        self.masks = {}
+
+    def get(self, dim: int, device: torch.device) -> torch.Tensor:
+        key = (dim, device)
+        mask = self.masks.get(key)
+        if mask is None:
+            mask = torch.zeros((dim,), dtype = torch.bool, device = device)
+            # IDs outside the vocabulary would be out of bounds for the mask
+            ids = [t for t in self.token_ids if 0 <= t < dim]
+            if ids:
+                mask[torch.tensor(ids, dtype = torch.long, device = device)] = True
+            self.masks[key] = mask
+        return mask
+
+
+class SS_BanTokens(SS_Base):
+    """
+    Mask out a fixed set of token IDs
+    """
+    def __init__(self, token_ids: list[int]):
+        self.mask = TokenMask(token_ids)
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+                state.logits.masked_fill_(self.mask.get(state.dim, state.logits.device), -float("inf"))
+                state.state = SS.LOGITS
+            case SS.LOGITS:
+                state.logits.masked_fill_(self.mask.get(state.dim, state.logits.device), -float("inf"))
+            case SS.LOGITS_S:
+                mask = self.mask.get(state.dim, state.logits.device)
+                state.logits.masked_fill_(mask[state.indices], -float("inf"))
+            case SS.PROBS | SS.PROBS_N:
+                state.probs.masked_fill_(self.mask.get(state.dim, state.probs.device), 0.0)
+                state.state = SS.PROBS
+            case SS.PROBS_S | SS.PROBS_N_S:
+                mask = self.mask.get(state.dim, state.probs.device)
+                state.probs.masked_fill_(mask[state.indices], 0.0)
+                state.state = SS.PROBS_S
+
+    def alt(self):
+        if not self.mask.token_ids:
+            return SS_NoOp()
+        return None
+
+
+class LogitBias:
+    """
+    Additive per-token logit bias vector with per (vocab size, device) caching. Token IDs outside
+    the vocabulary are ignored.
+    """
+    def __init__(self, logit_bias: dict[int, float]):
+        # keep finite biases and -inf (a hard ban); drop 0, nan and any value that
+        # overflows float32 to +inf (which would poison softmax and crash sampling).
+        # The bound is checked in float32 since the bias vector is float32; -inf and
+        # large negatives fall through as bans.
+        f32_max = torch.finfo(torch.float32).max
+        self.logit_bias = {
+            int(t): float(v) for t, v in logit_bias.items()
+            if float(v) != 0.0 and float(v) == float(v) and float(v) <= f32_max
+        }
+        self.vectors = {}
+
+    def get(self, dim: int, device: torch.device) -> torch.Tensor:
+        key = (dim, device)
+        vector = self.vectors.get(key)
+        if vector is None:
+            vector = torch.zeros((dim,), dtype = torch.float, device = device)
+            items = [(t, v) for t, v in self.logit_bias.items() if 0 <= t < dim]
+            if items:
+                ids = torch.tensor([t for t, _ in items], dtype = torch.long, device = device)
+                vals = torch.tensor([v for _, v in items], dtype = torch.float, device = device)
+                vector[ids] = vals
+            self.vectors[key] = vector
+        return vector
+
+
+class SS_LogitBias(SS_Base):
+    """
+    Add a fixed per-token bias to the logits, OAI style (the logit_bias sampler parameter). Must be
+    among the first steps in the sampler chain, before the logits are transformed. A bias of
+    -inf bans a token; zero, nan and +inf biases are ignored.
+    """
+    def __init__(self, logit_bias: dict[int, float]):
+        self.bias = LogitBias(logit_bias)
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+                state.logits += self.bias.get(state.dim, state.logits.device)
+            case SS.LOGITS:
+                state.logits += self.bias.get(state.dim, state.logits.device)
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if not self.bias.logit_bias:
+            return SS_NoOp()
+        return None
+
+
+@lru_cache(10)
+def xtc_default_protected_token_ids(tokenizer: Tokenizer) -> frozenset[int]:
+    """
+    Default set of token IDs for SS_XTC to leave in place, being every piece containing a newline
+    plus every extended token. Matches ExLlamaV2Sampler.get_default_xtc_mask_tokens in exllamav2.
+    """
+    pieces = tokenizer.get_id_to_piece_list(include_special_tokens = True)
+    protected = {t for t, piece in enumerate(pieces) if "\n" in piece}
+    protected.update(tokenizer.extended_id_to_piece.keys())
+    return frozenset(protected)
+
+
+class SS_XTC(SS_Base):
+    """
+    Exclude Top Choices. Of the tokens reaching the threshold probability, all but the least likely
+    one are excluded with probability p. Protected token IDs are held out of consideration.
+
+    The step averages the two outcomes of the exclusion, weighted by p. A categorical final step
+    then samples from exactly the distribution a random exclusion would give, while SS_Argmax
+    returns a fixed token where a random exclusion would alternate between two.
+
+    Matches xtc_cpu in exllamav2. The original XTC sampler and llama.cpp draw the outcome once per
+    sampler call and truncate the distribution.
+    """
+    def __init__(
+        self,
+        probability: float,
+        threshold: float,
+        protected_token_ids: frozenset[int] | list[int] | None = None,
+        tokenizer: Tokenizer | None = None,
+    ):
+        """
+        :param probability:
+            Probability of the exclusion happening. 0.0 disables the step, 1.0 makes it always happen
+        :param threshold:
+            Minimum probability for a token to be considered for exclusion. Values above 0.5 make the step
+            a no-op, since at most one token can exceed half the total probability
+        :param protected_token_ids:
+            Token IDs removed from the candidate set before the exclusion is chosen
+        :param tokenizer:
+            Used to derive a default set of protected IDs when protected_token_ids is None. Ignored if
+            protected_token_ids is given. The default set comes from xtc_default_protected_token_ids and
+            covers every token whose piece contains a newline plus every token in Tokenizer.extended_id_to_piece
+        """
+        self.probability = probability
+        self.threshold = threshold
+        assert 0.0 <= probability <= 1.0
+        assert 0.0 <= threshold <= 1.0
+        if protected_token_ids is None and tokenizer is not None:
+            protected_token_ids = xtc_default_protected_token_ids(tokenizer)
+        self.protected = TokenMask(protected_token_ids) if protected_token_ids else None
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N_S:
+                pass
+            case _:
+                raise ValueError("Sampling logic error")
+
+        # The probabilities are normalized and sorted descending, so at most 1/threshold of them
+        # can reach the threshold and those are the first ones
+        k = state.dim if self.threshold <= 0.0 else min(state.dim, int(1.0 / self.threshold) + 1)
+        probs = state.probs[:, :k]
+
+        qualifies = probs >= self.threshold
+        if self.protected is not None:
+            protected = self.protected.get(state.dim, probs.device)
+            qualifies &= ~protected[state.indices[:, :k]]
+
+        # Sorted descending, so the last qualifying position in a row is its least likely one
+        counts = qualifies.sum(dim = -1, keepdim = True)
+        excluded = qualifies & (qualifies.cumsum(dim = -1) < counts)
+
+        # Averaged over the two outcomes of the roll, an excluded token is scaled by (1 - p) and
+        # every other token by (1 + p * m / (1 - m)), for excluded mass m. Multiplying only the
+        # excluded tokens, by the ratio of those two factors, is proportional to that average and
+        # leaves the result unnormalized
+        x_mass = (probs * excluded).sum(dim = -1, keepdim = True)
+        scale = (1.0 - self.probability) / (1.0 + self.probability * x_mass / (1.0 - x_mass))
+        probs *= torch.where(excluded, scale, torch.ones_like(scale))
+        state.state = SS.PROBS_S
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.PROBS_N:
+                return [SS_Sort]
+            case SS.INIT | SS.LOGITS | SS.PROBS:
+                return [SS_Normalize, SS_Sort]
+            case SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize]
+            case _:
+                return None
+
+    def alt(self):
+        # Two tokens cannot both exceed half the total probability, so above that threshold there
+        # is never more than one token to choose between
+        if self.probability == 0.0 or self.threshold > 0.5:
             return SS_NoOp()
         return None
 
@@ -647,6 +872,190 @@ class SS_PresFreqP(SS_Base):
         return True
 
 
+@lru_cache(64)
+def dry_sequence_breaker_tokens(
+    tokenizer: Tokenizer,
+    sequence_breakers: tuple[str, ...]
+) -> frozenset[int]:
+    """
+    Resolve sequence breaker strings for SS_DRY to token IDs, being every token whose piece
+    contains one of the strings. llama.cpp resolves breaker strings the same way for its
+    single-token breakers (get_overlapping_token_sequences); the multi-token restart sequences
+    it additionally builds from partially overlapping tokens are not supported here.
+    """
+    pieces = tokenizer.get_id_to_piece_list(include_special_tokens = True)
+    return frozenset(
+        t for t, piece in enumerate(pieces) if any(s in piece for s in sequence_breakers)
+    )
+
+
+@lru_cache(10)
+def dry_default_sequence_breaker_tokens(tokenizer: Tokenizer) -> frozenset[int]:
+    """
+    Default set of sequence breaker token IDs for SS_DRY, being every piece containing one of
+    the characters .,!?<>[](){}\\n\\t" plus every extended token. Matches
+    ExLlamaV2Sampler.get_dry_default_sequence_breaker_tokens in exllamav2.
+    """
+    breakers = dry_sequence_breaker_tokens(tokenizer, tuple('.,!?<>[](){}\n\t"'))
+    return frozenset(breakers | set(tokenizer.extended_id_to_piece.keys()))
+
+
+# llama.cpp equivalent FLOAT_MAX_LOG: ln of the largest float32
+_DRY_FLOAT_MAX_LOG = 88.7228391
+
+# Matches at or beyond the exponent clamp all produce the same penalty, so the match scan stops
+# there. _DRY_MATCH_CAP bounds the scan where the clamp cannot (dry_base near 1)
+_DRY_MATCH_CAP = 2048
+
+
+@lru_cache(10)
+def _dry_default_breaker_mask(tokenizer: Tokenizer) -> TokenMask | None:
+    """
+    Default breaker set for a tokenizer as a shared TokenMask, so samplers built without
+    explicit breakers resolve them per tokenizer at sampling time.
+    """
+    ids = dry_default_sequence_breaker_tokens(tokenizer)
+    return TokenMask(ids) if ids else None
+
+
+def _dry_max_exponent(base: float) -> int:
+    """
+    llama.cpp's exponent clamp: FLOAT_MAX_LOG / log(dry_base) computed entirely in float32,
+    truncated to int, with 0 (no clamp) for bases too close to 1. The float32 arithmetic decides
+    which side of the truncation the quotient lands on: base = 2.0 gives exactly 128 in float32
+    where float64 gives 127.99999998 -> 127.
+    """
+    base_f = torch.tensor(base, dtype = torch.float)
+    if not (base_f > torch.tensor(1.000001, dtype = torch.float)).item():
+        return 0
+    return int(torch.tensor(_DRY_FLOAT_MAX_LOG, dtype = torch.float) / base_f.log())
+
+
+class SS_DRY(SS_Base):
+    """
+    Apply the DRY (Don't Repeat Yourself) repetition penalty based on past token IDs. Must be one
+    of the first steps in the sampler chain, before the logits are transformed.
+
+    A token that would extend a sequence already seen in the context is penalized by
+    multiplier * base ** (match_length - allowed_length), subtracted from its logit, where
+    match_length is the length of the longest context suffix whose earlier repetition the token
+    would continue. The matching semantics and the float32 exponent clamp follow llama.cpp's
+    llama_sampler_dry_apply (ported to koboldcpp-derived runtimes by pi6am; the scheme was
+    designed by p-e-w), with two divergences:
+
+    - sequence breakers are single tokens, where llama.cpp additionally builds multi-token
+      restart sequences from partially overlapping tokens;
+    - the match scan stops where the penalty stops changing, at allowed_length plus llama.cpp's
+      exponent clamp. For dry_base so close to 1 that llama.cpp applies no clamp (at most
+      1.000001) it stops at 2048 tokens instead, so a longer verbatim repeat is penalized as a
+      2048-token one; at those bases the penalty grows by at most 0.2% per further 2048 tokens.
+
+    The parameter surface follows exllamav2, including dry_range = 0 meaning the whole context.
+    exllamav2's own DRY is a different algorithm (an occurrence-counting trie), so outputs are not
+    expected to match it.
+
+    One kernel launch per sampled token (ext.dry_penalty) on the logits device; past_ids are
+    uploaded first if they live on the host. The scan is O(window) comparisons per token for
+    ordinary text and at most O(window * min(window, scan limit)) for a context that is one long
+    verbatim repeat, where the scan limit is allowed_length plus the clamp (2048 without one).
+    """
+    def __init__(
+        self,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 1.75,
+        dry_allowed_length: int = 2,
+        dry_range: int = 0,
+        dry_sequence_breakers: frozenset[int] | set[int] | list[int] | None = None,
+        tokenizer: Tokenizer | None = None,
+    ):
+        """
+        :param dry_multiplier:
+            Scale of the penalty. 0.0 disables the step. Negative values are not accepted (they
+            would reward repetition)
+        :param dry_base:
+            Base of the exponential penalty growth per token of match length. Values below 1.0
+            disable the step, matching llama.cpp
+        :param dry_allowed_length:
+            Longest repeated sequence that goes unpenalized; a token extending a repeat beyond
+            this length is penalized
+        :param dry_range:
+            Number of most recent past tokens to consider. 0 or negative considers the whole
+            context, following the exllamav2 convention for this parameter
+        :param dry_sequence_breakers:
+            Token IDs that repeated sequences cannot span, so that e.g. punctuation or chat
+            template markers do not count as repetition. Breaker tokens are never penalized.
+            None derives the default set via dry_default_sequence_breaker_tokens, from the
+            tokenizer given here or from the one passed to forward() at sampling time (the
+            generator passes its tokenizer); pass an empty set to disable breakers. Custom
+            breaker strings resolve to IDs via dry_sequence_breaker_tokens
+        :param tokenizer:
+            Used to derive the default breaker set when dry_sequence_breakers is None. Ignored
+            if dry_sequence_breakers is given
+        """
+        assert dry_multiplier >= 0.0, "dry_multiplier must be non-negative"
+        assert isinstance(dry_allowed_length, int) or dry_allowed_length.is_integer(), \
+            "dry_allowed_length must be integer"
+        assert dry_allowed_length >= 0, "dry_allowed_length must be non-negative"
+        assert isinstance(dry_range, int) or dry_range.is_integer(), "dry_range must be integer"
+        # With no explicit breakers and no tokenizer bound here, the default set is resolved
+        # per tokenizer at sampling time instead
+        self.default_breakers = dry_sequence_breakers is None and tokenizer is None
+        if dry_sequence_breakers is None and tokenizer is not None:
+            dry_sequence_breakers = dry_default_sequence_breaker_tokens(tokenizer)
+        # llama.cpp stores dry_multiplier and dry_base as float32 and computes the penalty from
+        # the rounded values; round here so identical settings give identical penalties
+        self.dry_multiplier = float(torch.tensor(dry_multiplier, dtype = torch.float))
+        self.dry_base = float(torch.tensor(dry_base, dtype = torch.float))
+        self.dry_allowed_length = int(dry_allowed_length)
+        self.dry_range = int(dry_range)
+        self.max_exponent = _dry_max_exponent(self.dry_base)
+        self.breakers = TokenMask(dry_sequence_breakers) if dry_sequence_breakers else None
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                in_logits = state.in_logits
+                state.logits = torch.empty_like(in_logits, dtype = torch.float)
+            case SS.LOGITS:
+                in_logits = state.logits
+            case _:
+                raise ValueError("Sampling logic error")
+        breakers = self.breakers
+        if self.default_breakers and state.tokenizer is not None:
+            breakers = _dry_default_breaker_mask(state.tokenizer)
+        assert state.past_ids is not None, "SS_DRY requires past token IDs"
+        assert state.past_ids.shape[0] == state.bsz
+        device = in_logits.device
+        past_ids = state.past_ids
+        if past_ids.device != device:
+            past_ids = past_ids.to(device, non_blocking = past_ids.is_pinned())
+        n_ws = state.bsz * state.dim
+        scratch = torch.full((n_ws + state.bsz,), -1, dtype = torch.int32, device = device)
+        ext.dry_penalty(
+            in_logits,
+            state.logits,
+            past_ids.contiguous(),
+            breakers.get(state.dim, device) if breakers is not None else None,
+            scratch[:n_ws],
+            scratch[n_ws:],
+            self.dry_multiplier,
+            self.dry_base,
+            self.dry_allowed_length,
+            self.dry_range,
+            self.max_exponent,
+            _DRY_MATCH_CAP,
+        )
+        state.state = SS.LOGITS
+
+    def alt(self):
+        if self.dry_multiplier == 0.0 or self.dry_base < 1.0:
+            return SS_NoOp()
+        return None
+
+    def reqs_past_ids(self):
+        return True
+
+
 class SS_AdaptiveP(SS_Base):
     """
     Implements Adaptive-P sampler. Maintains state but does not remember past states (keeps future state in case
@@ -694,7 +1103,7 @@ class SS_AdaptiveP(SS_Base):
 
                 temp = torch.argmax(state.logits, dim = -1)
                 state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
-                sampled_prob = state.probs[0, temp].item()
+                sampled_prob = state.probs[buffered_arange(state.bsz, state.in_logits.device), temp]   # per row; see log below
 
                 # self.log.append((adapted_target, sampled_prob))
                 # if len(self.log) == 300:
@@ -733,8 +1142,10 @@ class CustomSampler(Sampler):
         super().__init__()
 
         # Simplify the stack (identity steps become no-ops), then collapse an eligible tail
-        # into the fused kernel step. Leading penalty steps are kept as-is; they feed fp32
-        # logits to the fused step. Ineligible stacks fall through to the step-by-step path.
+        # into the fused kernel step. Leading penalty and ban steps are kept as-is; they feed
+        # fp32 logits to the fused step, which already accepts -inf entries from the logit mask
+        # and the padded vocabulary region. Ineligible stacks fall through to the step-by-step
+        # path.
         simplified = []
         for step in steps:
             self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
@@ -749,7 +1160,7 @@ class CustomSampler(Sampler):
         fused_tail = None
         if fused_sampler_enable:
             i = 0
-            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP):
+            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_DRY, SS_BanTokens, SS_LogitBias):
                 i += 1
             fused_tail = _match_fused_tail(simplified[i:])
             if fused_tail is not None:
@@ -796,6 +1207,13 @@ class CustomSampler(Sampler):
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
+        # The mask may be a dense additive half tensor or a packed int32 bitmask with 32 tokens
+        # per word (bit clear = masked out), as produced by e.g. LLGuidanceFilter
+        mask_is_bits = logit_mask is not None and logit_mask.dtype == torch.int32
+        mask_width = None
+        if logit_mask is not None:
+            mask_width = logit_mask.shape[-1] * 32 if mask_is_bits else logit_mask.shape[-1]
+
         # For a fully fused stack the mask is applied inside the kernel; a mask narrower than
         # the logits bounds the scan instead of being padded with -inf. Same for the padded
         # vocab region, which the in-place fill above has already masked.
@@ -804,10 +1222,10 @@ class CustomSampler(Sampler):
         if (
             self.fused_only and
             (logit_mask is None or (
-                logit_mask.dtype == torch.half and
+                (logit_mask.dtype == torch.half or mask_is_bits) and
                 logit_mask.is_contiguous() and
                 (logit_mask.shape[0] == 1 or
-                    (logit_mask.shape[0] == bsz and logit_mask.shape[-1] == dim))
+                    (logit_mask.shape[0] == bsz and (mask_is_bits or logit_mask.shape[-1] == dim)))
             ))
         ):
             fused_dim = dim
@@ -815,7 +1233,13 @@ class CustomSampler(Sampler):
                 fused_dim = min(fused_dim, tokenizer.actual_vocab_size)
             if logit_mask is not None:
                 fused_mask = logit_mask.view(logit_mask.shape[0], -1)
-                fused_dim = min(fused_dim, fused_mask.shape[-1])
+                fused_dim = min(fused_dim, mask_width)
+
+        # Apply packed bitmask with a masked copy (out of place, like the additive path below)
+        elif mask_is_bits:
+            masked = torch.empty_like(logits.view(bsz, dim))
+            ext.apply_logit_bitmask(logits.view(bsz, dim), masked, logit_mask)
+            logits = masked
 
         # Apply logit mask/bias tensor
         elif logit_mask is not None:
@@ -830,6 +1254,7 @@ class CustomSampler(Sampler):
             bsz = bsz,
             in_logits = logits.view(bsz, dim),
             past_ids = sequence_ids,
+            tokenizer = tokenizer,
             fused_mask = fused_mask,
             fused_dim = fused_dim,
         )

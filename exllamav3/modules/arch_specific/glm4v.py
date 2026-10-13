@@ -34,7 +34,7 @@ class Glm4VPosEmbedding(Module):
 
     @override
     def weights_numel(self):
-        return self.num_position_embeddings + self.hidden_size
+        return self.num_position_embeddings * self.hidden_size
 
 
     def optimizer_targets(self):
@@ -120,13 +120,20 @@ class Glm4VVisionPatchMerger(Module):
         use_postshuffle_norm: bool = False,
         out_dtype: torch.dtype | None = None,
         qmap: str | None = None,
+        act_limit: float = 0.0,
+        gelu_approx: str = "tanh",
     ):
         super().__init__(config, key, None)
         self.hidden_size = hidden_size
         self.interm_size = interm_size
         self.out_dtype = out_dtype
         self.use_postshuffle_norm = use_postshuffle_norm
+        # GLM5.3: clamped-silu gate (clamp BEFORE the activation, HF convention) and exact GELU
+        self.act_limit = act_limit
+        self.gelu_approx = gelu_approx
 
+        # Padded to the EXL3 tile grid like GatedMLP: GLM-4.6V's merger is 10944 wide. gate / up keep
+        # their padded columns (their pad values only ever meet zero rows of the padded down weight)
         self.proj = Linear(
             config = config,
             key = f"{key}.{key_proj}",
@@ -134,7 +141,6 @@ class Glm4VVisionPatchMerger(Module):
             out_features = self.hidden_size,
             qmap = qmap + ".input",
             out_dtype = torch.half,
-            pad_to = 1
         )
         self.gate = Linear(
             config = config,
@@ -143,7 +149,6 @@ class Glm4VVisionPatchMerger(Module):
             out_features = self.interm_size,
             qmap = qmap + ".post_norm",
             out_dtype = torch.half,
-            pad_to = 1
         )
         self.up = Linear(
             config = config,
@@ -152,7 +157,6 @@ class Glm4VVisionPatchMerger(Module):
             out_features = self.interm_size,
             qmap = qmap + ".post_norm",
             out_dtype = torch.half,
-            pad_to = 1
         )
         self.down = Linear(
             config = config,
@@ -162,7 +166,7 @@ class Glm4VVisionPatchMerger(Module):
             qmap = qmap + ".down",
             out_dtype = self.out_dtype,
             allow_input_padding = True,
-            pad_to = 1
+            trim_padded_out = True,
         )
 
         self.register_submodule(self.proj)
@@ -204,11 +208,13 @@ class Glm4VVisionPatchMerger(Module):
         x = x.view(-1, self.hidden_size)
         y = self.proj.forward(x.half(), params)
         y = self.norm.forward(y, params).half()
-        y = F.gelu(y, approximate = "tanh")
+        y = F.gelu(y, approximate = self.gelu_approx)
         g = self.gate.forward(y, params)
-        g = F.silu(g)
-        y = self.up.forward(y, params)
-        y *= g
+        u = self.up.forward(y, params)
+        if self.act_limit:
+            g = g.clamp(max = self.act_limit)
+            u = u.clamp(min = -self.act_limit, max = self.act_limit)
+        y = u * F.silu(g)
         y = self.down.forward(y, params)
         y = y.view(1, -1, self.hidden_size)
         return y

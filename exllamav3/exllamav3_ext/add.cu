@@ -61,9 +61,16 @@ void add_gr
     uint64_t numel_y = y.numel();
     if (numel_y != numel_x)
     {
-        TORCH_CHECK(numel_y < numel_x, "Tensor shape mismatch (y > x)");
+        // y repeats over x: an empty y can't fill a non-empty x, any y divides an empty x (bias over no rows)
+        TORCH_CHECK(numel_y > 0, "Tensor shape mismatch (empty y cannot broadcast to x)");
+        TORCH_CHECK(numel_y < numel_x || numel_x == 0, "Tensor shape mismatch (y > x)");
         TORCH_CHECK(numel_x % numel_y == 0, "Tensor shape mismatch (y must divide x)");
     }
+    TORCH_CHECK((uint64_t) z.numel() == numel_x, "Tensor shape mismatch (z must match x)");
+    TORCH_CHECK_FLOAT_HALF(x);
+    TORCH_CHECK_FLOAT_HALF(y);
+    TORCH_CHECK_FLOAT_HALF(z);
+    if (!numel_x) return;
 
     #define INSTANCE(xt_, yt_, zt_, xt__, yt__, zt__, kernel) \
     if (xt == xt_ && yt == yt_ && zt == zt_) \
@@ -183,26 +190,31 @@ __global__ void moe_bias_add_kernel
     const int stride,
     const int width,
     const int min_expert,
-    const int max_expert
+    const int max_expert,
+    const int packed
 )
 {
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
     int k = blockIdx.y;
     if (col >= width) return;
     // Expert-parallel split: sel holds global expert indices but the pointer table only covers the
-    // local range, and the mgemm PACKS its output rows to the local entries of sel (in order). Skip
-    // foreign experts and add each local expert's bias at its packed row, not its position in sel
+    // local range. Skip foreign experts. At num_tokens == 1 the mgemm PACKS its output rows to the
+    // local entries of sel (in order), so the bias lands at the packed row; at num_tokens > 1 the
+    // mgemm masks in place (position-preserving), so the bias lands at the slot's own row
     int64_t e = sel[k];
     int row = k;
     if (min_expert >= 0)
     {
         if (e < min_expert || e >= max_expert) return;
         e -= min_expert;
-        row = 0;
-        for (int i = 0; i < k; ++i)
+        if (packed)
         {
-            int64_t ei = sel[i];
-            if (ei >= min_expert && ei < max_expert) row++;
+            row = 0;
+            for (int i = 0; i < k; ++i)
+            {
+                int64_t ei = sel[i];
+                if (ei >= min_expert && ei < max_expert) row++;
+            }
         }
     }
     const half* b = (const half*) bias_ptrs[e];
@@ -216,28 +228,33 @@ __global__ void moe_bias_add_weighted_kernel
     const uintptr_t* __restrict__ bias_ptrs,
     const int64_t* __restrict__ sel,
     const half* __restrict__ weights,
-    const int num_sel,
+    const int num_sel,      // experts per token (top_k); grid.y = token
     const int width,
     const int min_expert,
-    const int max_expert
+    const int max_expert,
+    const int out_stride    // row stride of out, in elements
 )
 {
     int col = blockIdx.x * C2D_THREADS + threadIdx.x;
+    int t = blockIdx.y;
     if (col >= width) return;
-    float acc = out[col];
+    const int64_t* sel_t = sel + (int64_t) t * num_sel;
+    const half* weights_t = weights + (int64_t) t * num_sel;
+    float* out_t = out + (int64_t) t * out_stride;
+    float acc = out_t[col];
     for (int k = 0; k < num_sel; ++k)
     {
         // Foreign experts contribute on their own rank only
-        int64_t e = sel[k];
+        int64_t e = sel_t[k];
         if (min_expert >= 0)
         {
             if (e < min_expert || e >= max_expert) continue;
             e -= min_expert;
         }
         const half* b = (const half*) bias_ptrs[e];
-        acc += __half2float(weights[k]) * __half2float(b[col]);
+        acc += __half2float(weights_t[k]) * __half2float(b[col]);
     }
-    out[col] = acc;
+    out_t[col] = acc;
 }
 
 void moe_bias_add_gr
@@ -247,7 +264,8 @@ void moe_bias_add_gr
     const at::Tensor& sel,
     int min_expert,
     int max_expert,
-    Graph* graph
+    Graph* graph,
+    int num_tokens
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(interm.device());
@@ -268,7 +286,8 @@ void moe_bias_add_gr
         stride,
         width,
         min_expert,
-        max_expert
+        max_expert,
+        num_tokens == 1 ? 1 : 0
     );
     if (graph)
     {
@@ -296,9 +315,13 @@ void moe_bias_add_weighted_gr
     TORCH_CHECK_DTYPE(out, kFloat);
     TORCH_CHECK_DTYPE(sel, kLong);
     TORCH_CHECK_DTYPE(weights, kHalf);
-    int num_sel = (int) sel.numel();
+    // sel/weights are [num_tokens, experts_per_token]; out has a row per token (row 0 only when
+    // num_tokens == 1, the legacy/bsz-1 case -- unchanged behavior there)
+    int num_tokens = (int) sel.size(0);
+    int num_sel = (int) sel.size(-1);
     int width = (int) out.size(-1);
-    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS));
+    int out_stride = (int) out.stride(0);
+    dim3 grid(CEIL_DIVIDE(width, C2D_THREADS), num_tokens);
 
     moe_bias_add_weighted_kernel<<<grid, C2D_THREADS, 0, stream>>>
     (
@@ -309,7 +332,8 @@ void moe_bias_add_weighted_gr
         num_sel,
         width,
         min_expert,
-        max_expert
+        max_expert,
+        out_stride
     );
     if (graph)
     {

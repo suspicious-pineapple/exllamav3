@@ -45,7 +45,7 @@ prompt_formats = {
     ),
     "gemma": (
         "<bos><start_of_turn>user\n"
-        "Complete the following Python function:\n\n{{problem}}<|eot_id|>"
+        "Complete the following Python function:\n\n{{problem}}<end_of_turn>"
         "<start_of_turn>model\n"
         "```python\n{{problem}}",
         "    "
@@ -115,7 +115,9 @@ def main(args):
         model = model,
         cache = cache,
         max_batch_size = args.max_batch_size,
-        tokenizer = tokenizer
+        tokenizer = tokenizer,
+        cpu_cache_size = int(args.cpu_cache_size * 1024 ** 3),
+        recurrent_cache_size = int(args.recurrent_cache_size * 1024 ** 3),
     )
     sampler = ComboSampler(
         temperature = args.temperature,

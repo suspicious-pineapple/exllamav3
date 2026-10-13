@@ -48,7 +48,7 @@ void apply_rep_pens_kernel
     // Record which tokens from the range appear in past_ids
     for (int i = threadIdx.x; i < past_len; i += NUM_THREADS)
     {
-        if (i <= past_len - sustain_range - decay_range)
+        if (i < past_len - sustain_range - decay_range)
             continue;
 
         int tid = (int) past_ids[i];
@@ -105,12 +105,13 @@ void apply_rep_pens
 
     TORCH_CHECK_DTYPE(out_logits, kFloat);
     TORCH_CHECK_DTYPE(past_ids, kLong);
-    TORCH_CHECK(in_logits.size(0) == 1, "rep. penalties only implemented for bsz 1");  // TODO
+    TORCH_CHECK(in_logits.size(0) <= 1, "rep. penalties only implemented for bsz 1");  // TODO
     TORCH_CHECK_SHAPES(past_ids, 0, in_logits, 0, 1);
     TORCH_CHECK_SHAPES_FULL(in_logits, out_logits);
 
     int past_len = past_ids.size(1);
     int vocab_size = in_logits.size(1);
+    if (!in_logits.size(0) || !vocab_size) return;
     int num_blocks = CEIL_DIVIDE(vocab_size, BLOCK_VOCAB_SPAN);
 
     #define kernel_args \
@@ -165,7 +166,7 @@ void apply_pres_freq_pens_kernel
     // Record which tokens from the range appear in past_ids
     for (int i = threadIdx.x; i < past_len; i += NUM_THREADS)
     {
-        if (i <= past_len - sustain_range - decay_range)
+        if (i < past_len - sustain_range - decay_range)
             continue;
 
         int tid = (int) past_ids[i];
@@ -178,7 +179,7 @@ void apply_pres_freq_pens_kernel
         float factor = decay_range > 0 ? 1.0f - (distf - sustain_rangef) / decay_rangef : 1.0f;
         factor = CLAMP(factor, 0.0f, 1.0f);
         atomicAdd(frequency + tid - range_min, factor * freq_p);
-        shmemAtomicMaxF(presence + tid - range_min, factor * pres_p);
+        shmemAtomicMaxF(presence + tid - range_min, factor);
     }
     __syncthreads();
 
@@ -195,7 +196,7 @@ void apply_pres_freq_pens_kernel
             v = ((float*) in_logits)[i + range_min];
 
         v -= frequency[i];
-        v -= presence[i];
+        v -= presence[i] * pres_p;
         out_logits[i + range_min] = v;
     }
 }
@@ -216,12 +217,13 @@ void apply_pres_freq_pens
 
     TORCH_CHECK_DTYPE(out_logits, kFloat);
     TORCH_CHECK_DTYPE(past_ids, kLong);
-    TORCH_CHECK(in_logits.size(0) == 1, "rep. penalties only implemented for bsz 1");  // TODO
+    TORCH_CHECK(in_logits.size(0) <= 1, "rep. penalties only implemented for bsz 1");  // TODO
     TORCH_CHECK_SHAPES(past_ids, 0, in_logits, 0, 1);
     TORCH_CHECK_SHAPES_FULL(in_logits, out_logits);
 
     int past_len = past_ids.size(1);
     int vocab_size = in_logits.size(1);
+    if (!in_logits.size(0) || !vocab_size) return;
     int num_blocks = CEIL_DIVIDE(vocab_size, BLOCK_VOCAB_SPAN);
 
     #define kernel_args \

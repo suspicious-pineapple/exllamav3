@@ -11,6 +11,9 @@
 #include "../quant/exl3_devctx.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_gemv_multirow_rdna.cuh"
+#endif
 
 std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     int bsz,
@@ -64,225 +67,104 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
     }
 }
 
-void BC_BlockSparseMLP::run_bsz1_gr
-(
-    const at::Tensor& y,
-    at::Tensor& selected_experts,
-    at::Tensor& routing_weights,
-    Graph* graph
-)
-{
-    //py::gil_scoped_release _;
-
-    // Padded hidden dim: stage the input through the zero-padded static (the pad columns are
-    // zeroed python-side at construction and never written)
-    at::Tensor yi;
-    if (y_pad)
-    {
-        at::Tensor yp = y_pad.value();
-        copy2d_gr(y, yp, graph);
-        yi = yp.unsqueeze(0);
-    }
-    else
-        yi = y.unsqueeze(0);
-
-    if (gated)
-    {
-        exl3_mgemm_gr
-        (
-            yi,
-            gate_ptrs_trellis,
-            interm_g,
-            gate_ptrs_suh,
-            yh,
-            gate_ptrs_svh,
-            selected_experts,
-            {},
-            gate_K,
-            -1,
-            gate_mcg,
-            gate_mul1,
-            min_expert,
-            max_expert,
-            0,
-            graph
-        );
-        if (gate_bias_ptrs)
-            moe_bias_add_gr(interm_g, gate_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
-    }
-
-    exl3_mgemm_gr
-    (
-        yi,
-        up_ptrs_trellis,
-        interm_u,
-        up_ptrs_suh,
-        yh,
-        up_ptrs_svh,
-        selected_experts,
-        {},
-        up_K,
-        -1,
-        up_mcg,
-        up_mul1,
-        min_expert,
-        max_expert,
-        0,
-        graph
-    );
-
-    if (up_bias_ptrs)
-        moe_bias_add_gr(interm_u, up_bias_ptrs.value(), selected_experts, min_expert, max_expert, graph);
-
-    if (!gated)
-        // relu(u) * u = relu^2(u), the non-gated activation
-        relu_mul_gr(interm_u, interm_u, interm_a, act_limit, graph);
-    else if (act_silu)
-        silu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
-    else if (act_gelu)
-        gelu_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
-    else if (act_silu_oai)
-        silu_oai_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
-    else if (act_relu2)
-        relu2_mul_gr(interm_g, interm_u, interm_a, act_limit, graph);
-
-    // A_had must not alias A: the kernel stages the rotated input in A_had, and the autotuner
-    // relaunches the (otherwise idempotent) kernel on the first call. interm_g is free here
-    exl3_mgemm_gr
-    (
-        interm_a,
-        down_ptrs_trellis,
-        out_d,
-        down_ptrs_suh,
-        interm_g,
-        down_ptrs_svh,
-        selected_experts,
-        routing_weights,
-        down_K,
-        -1,
-        down_mcg,
-        down_mul1,
-        min_expert,
-        max_expert,
-        0,
-        graph
-    );
-    if (down_bias_ptrs)
-        moe_bias_add_weighted_gr(out_d, down_bias_ptrs.value(), selected_experts, routing_weights, min_expert, max_expert, graph);
-    if (out_trim)
-    {
-        // Exact-width copy out of the padded down result (row 0 holds the weighted reduction)
-        at::Tensor src = out_d.select(0, 0);
-        at::Tensor dst = out_trim.value();
-        copy2d_gr(src, dst, graph);
-    }
-
-    if (shared_experts)
-    {
-        shared_experts->run_bsz1_gr(yi, out_d_sh.value(), graph);
-        if (shared_gate)
-        {
-            add_sigmoid_gate_proj_gr(out_d_sh.value(), yi, out_d, shared_gate->weight, graph);
-        }
-        else
-        {
-            add_gr(out_d, out_d_sh.value(), out_d, graph);
-        }
-    }
-}
-
-void BC_BlockSparseMLP::run_bsz1
+void BC_BlockSparseMLP::run_bszN
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
     at::Tensor& routing_weights
 )
 {
+    // Two fused launches per layer cover every (token, expert) slot of the batch (see
+    // exl3_moe_coop_kernel.cuh): input rotation + gate/up GEMVs + activation, then down GEMVs +
+    // the weighted per-token reduction, with expert biases, padded dims (x zero-padded to the
+    // quantized input width in the kernel, output trimmed to H) and expert-range masking
+    // (out-of-range picks contribute exact zeros to the partial sum) handled inside. Nothing is
+    // captured or patched: routing tensors are read directly, so no per-bsz statics or graphs
+    int num_tokens = (int) y.size(0);
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
+
     c10::cuda::CUDAGuard device_guard(y.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+#if defined(USE_ROCM)
+    if (rdna_moe && run_bszN_rdna(y, selected_experts, routing_weights)) return;
+#endif
+
+    // Shared experts run through their own multi-row graph first (same stream); the kernel adds
+    // the result into the routed sum, through the sigmoid gate when there is one
+    c10::optional<at::Tensor> sh_o;
+    if (sh_coop)
     {
-        run_bsz1_gr(y, selected_experts, routing_weights, nullptr);
-        graph_bsz1.ready_to_record = true;
+        // One-expert fused launch at the shared expert's own bit width (expert 0, weight 1);
+        // the sigmoid gate, if any, is applied by the routed launch when it merges the result
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+        exl3_moe_coop_run(sh_coop_p, sh_K_gu, sh_K_d, sh_cb, y, sh_sel.slice(0, 0, num_tokens), sh_rw.slice(0, 0, num_tokens), c10::nullopt);
+        sh_o = out_d_sh_n;
     }
-    else
+    else if (shared_experts)
     {
-        if (!graph_bsz1.ready)
+        at::Tensor x_dense = y.unsqueeze(0);
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+        shared_experts->run_bszN(x_dense, out_d_sh_n);
+        sh_o = out_d_sh_n;
+    }
+    exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+}
+
+#if defined(USE_ROCM)
+// RDNA route of run_bszN: four launches through exl3_rocm_moe_decode into out_d2, then the shared expert (its
+// own multi-row graph, merged through the sigmoid gate when there is one, as the fused kernels do) and the copy
+// into out_bszn. Returns false, having launched nothing, when the call is outside the op's bounds
+bool BC_BlockSparseMLP::run_bszN_rdna
+(
+    const at::Tensor& y,
+    const at::Tensor& selected_experts,
+    const at::Tensor& routing_weights
+)
+{
+    const int bsz = (int) y.size(0);
+    const int top_k = (int) selected_experts.size(-1);
+    const int S = bsz * top_k;
+    const int Hi = (int) yh2.size(-1);
+    const int I = (int) interm_a2.size(-1);
+    const int Ho = (int) out_d2.size(-1);
+    if (y.size(-1) != Hi || !y.is_contiguous() || !selected_experts.is_contiguous() || !routing_weights.is_contiguous()) return false;
+    if (selected_experts.scalar_type() != at::kLong || routing_weights.scalar_type() != at::kHalf) return false;
+    if (!exl3_rocm_moe_decode_fits(S, Hi, I, Ho, rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb)) return false;
+    if (yh2.numel() < (int64_t) 2 * S * Hi || interm_gu.numel() < (int64_t) 2 * S * I
+        || interm_a2.numel() < (int64_t) S * I || out_d2.numel() < (int64_t) S * Ho) return false;
+
+    exl3_rocm_moe_decode
+    (
+        y, selected_experts, routing_weights,
+        rdna_gu_trellis, rdna_gu_suh, rdna_gu_svh,
+        down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
+        yh2, interm_gu, interm_a2, out_d2,
+        rdna_K_gu, rdna_cb, rdna_K_d, rdna_cb, act_limit
+    );
+
+    const int H = (int) out_bszn.size(-1);
+    at::Tensor routed = out_d2.view({-1, Ho}).slice(0, 0, bsz).slice(1, 0, H);
+    at::Tensor dst = out_bszn.slice(0, 0, bsz);
+    if (shared_experts && out_d_sh)
+    {
+        at::Tensor x_dense = y.unsqueeze(0);
+        at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, bsz);
+        shared_experts->run_bszN(x_dense, out_d_sh_n);
+        at::Tensor sh = out_d_sh_n.view({bsz, -1}).slice(1, 0, H);
+        dst.copy_(routed);
+        if (shared_gate)
         {
-            graph_bsz1.capture_begin();
-            run_bsz1_gr(y, selected_experts, routing_weights, &graph_bsz1);
-            graph_bsz1.capture_end();
-        }
-
-        // Padded hidden dim: y feeds the staging copy at the head of the graph and the mgemms
-        // read the (static) padded buffer
-        void* yptr = y_pad ? y_pad.value().data_ptr() : (void*) y.data_ptr();
-        auto args = std::vector<PPTR>();
-        if (y_pad)
-            args.push_back(PPTR(GP_copy2d_src, (void*) y.data_ptr()));
-
-        if (gated)
-        {
-            args.push_back(PPTR(GP_mgemm_A,            yptr));
-            args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
-            args.push_back(PPTR(GP_end,                nullptr));
-
-            if (gate_bias_ptrs)
-            {
-                args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
-                args.push_back(PPTR(GP_end,                nullptr));
-            }
-        }
-
-        args.push_back(PPTR(GP_mgemm_A,            yptr));
-        args.push_back(PPTR(GP_mgemm_indices,      (void*) selected_experts.data_ptr()));
-        args.push_back(PPTR(GP_end,                nullptr));
-
-        if (up_bias_ptrs)
-        {
-            args.push_back(PPTR(GP_moe_bias_add_sel,   (void*) selected_experts.data_ptr()));
-            args.push_back(PPTR(GP_end,                nullptr));
-        }
-
-        auto patch_bias = [&]()
-        {
-            args.push_back(PPTR(GP_moe_bias_add_weighted_sel,       (void*) selected_experts.data_ptr()));
-            args.push_back(PPTR(GP_moe_bias_add_weighted_weights,   (void*) routing_weights.data_ptr()));
-            args.push_back(PPTR(GP_end,                             nullptr));
-        };
-
-        if (shared_experts && shared_gate)
-        {
-            args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
-            args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
-            args.push_back(PPTR(GP_end,                         nullptr));
-            if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
-            args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     (void*) y.data_ptr()));
-            args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
-        }
-        else if (shared_experts)
-        {
-            args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
-            args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
-            args.push_back(PPTR(GP_end,                         nullptr));
-            if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     (void*) y.data_ptr()));
-            args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
-            args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
+            at::Tensor g = at::sigmoid(at::matmul(y.to(at::kFloat), shared_gate->weight.reshape({-1, 1}).to(at::kFloat)));
+            dst.addcmul_(g, sh);
         }
         else
-        {
-            args.push_back(PPTR(GP_mgemm_C,                     (void*) out_d.data_ptr()));
-            args.push_back(PPTR(GP_mgemm_indices,               (void*) selected_experts.data_ptr()));
-            args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
-            if (down_bias_ptrs) patch_bias();
-        }
-
-        graph_bsz1.launch(args, stream);
+            dst.add_(sh);
     }
+    else
+        dst.copy_(routed);
+    return true;
 }
+#endif
 
 BC_BlockSparseMLP::BC_BlockSparseMLP
 (
@@ -296,7 +178,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     at::Tensor _out_d,
     at::Tensor _out_d2,
     c10::optional<at::Tensor> _out_d_sh,
-    c10::optional<at::Tensor> _z,
+    at::Tensor _coop_ctr,
+    at::Tensor _had_u,
     at::Tensor _dq_temp_up,
     at::Tensor _dq_temp_down,
     int _min_expert,
@@ -304,19 +187,19 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     at::Tensor _gate_ptrs_trellis,
     at::Tensor _gate_ptrs_suh,
     at::Tensor _gate_ptrs_svh,
-    int _gate_K,
+    float _gate_K,
     bool _gate_mcg,
     bool _gate_mul1,
     at::Tensor _up_ptrs_trellis,
     at::Tensor _up_ptrs_suh,
     at::Tensor _up_ptrs_svh,
-    int _up_K,
+    float _up_K,
     bool _up_mcg,
     bool _up_mul1,
     at::Tensor _down_ptrs_trellis,
     at::Tensor _down_ptrs_suh,
     at::Tensor _down_ptrs_svh,
-    int _down_K,
+    float _down_K,
     bool _down_mcg,
     bool _down_mul1,
     bool _act_silu,
@@ -331,12 +214,12 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     at::Tensor _gu_trellis_ptr,
     at::Tensor _gu_suh_ptr,
     at::Tensor _gu_svh_ptr,
+    at::Tensor _out_bszn,
     c10::optional<at::Tensor> _gate_bias_ptrs,
     c10::optional<at::Tensor> _up_bias_ptrs,
     c10::optional<at::Tensor> _down_bias_ptrs,
-    c10::optional<at::Tensor> _y_pad,
-    c10::optional<at::Tensor> _out_trim,
-    bool _act_relu2
+    bool _act_relu2,
+    bool _sh_coop
 ) :
         yh2                 (std::move(_yh2)),
         yh                  (std::move(_yh)),
@@ -348,7 +231,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         out_d               (std::move(_out_d)),
         out_d2              (std::move(_out_d2)),
         out_d_sh            (std::move(_out_d_sh)),
-        z                   (std::move(_z)),
+        coop_ctr            (std::move(_coop_ctr)),
+        had_u               (std::move(_had_u)),
         dq_temp_up          (std::move(_dq_temp_up)),
         dq_temp_down        (std::move(_dq_temp_down)),
         min_expert          (_min_expert),
@@ -387,15 +271,20 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         gate_bias_ptrs      (std::move(_gate_bias_ptrs)),
         up_bias_ptrs        (std::move(_up_bias_ptrs)),
         down_bias_ptrs      (std::move(_down_bias_ptrs)),
-        y_pad               (std::move(_y_pad)),
-        out_trim            (std::move(_out_trim))
+        out_bszn            (std::move(_out_bszn))
 {
     // Non-gated experts (NemotronH): python passes an empty gates vector (the gate pointer
     // tables are unused placeholders) and act_relu2; the gate GEMMs are skipped throughout
     gated = !gates.empty();
     TORCH_CHECK(gated || act_relu2, "BC_BlockSparseMLP: gateless experts require act_relu2");
-    TORCH_CHECK(!(shared_experts && (down_bias_ptrs || y_pad)),
-        "BC_BlockSparseMLP: shared experts not supported with expert biases or padded dims");
+    // The fused decode kernels decode all three projections with one codebook instantiation
+    TORCH_CHECK(gate_mcg == up_mcg && up_mcg == down_mcg && gate_mul1 == up_mul1 && up_mul1 == down_mul1,
+                "BC_BlockSparseMLP: gate/up/down must share a codebook");
+    TORCH_CHECK(!shared_gate || shared_experts, "BC_BlockSparseMLP: shared gate without shared experts");
+    TORCH_CHECK(!gated || gate_K == up_K, "BC_BlockSparseMLP: gate and up must share a bit width");
+    TORCH_CHECK(coop_ctr.scalar_type() == at::kInt && coop_ctr.numel() >=
+                exl3_moe_coop_ctr_len(interm_u.size(0), out_bszn.size(0), interm_u.size(-1), out_d.size(-1)),
+                "BC_BlockSparseMLP: counter scratch too small");
     gate_ptrs_trellis_cpu   = gate_ptrs_trellis.cpu();
     gate_ptrs_suh_cpu       = gate_ptrs_suh.cpu();
     gate_ptrs_svh_cpu       = gate_ptrs_svh.cpu();
@@ -409,6 +298,129 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
     max_experts_per_token = interm_g.size(0);
     max_tokens_per_expert = max_experts_per_token;
 
+    // Static part of the fused decode kernels' parameters, validated once
+    {
+        int act = act_silu_oai ? MOE_COOP_ACT_SILU_OAI :
+                  act_gelu ? MOE_COOP_ACT_GELU :
+                  act_relu2 ? MOE_COOP_ACT_RELU2 :
+                  MOE_COOP_ACT_SILU;
+        c10::optional<at::Tensor> sh_w;
+        if (shared_gate) sh_w = shared_gate->weight;
+        coop_p = exl3_moe_coop_prepare
+        (
+            (int) yh.size(-1),
+            gate_ptrs_trellis, gate_ptrs_suh, gate_ptrs_svh,
+            up_ptrs_trellis, up_ptrs_suh, up_ptrs_svh,
+            down_ptrs_trellis, down_ptrs_suh, down_ptrs_svh,
+            gate_bias_ptrs, up_bias_ptrs, down_bias_ptrs,
+            gate_K, up_K, down_K,
+            up_mcg, up_mul1,
+            act, act_limit, gated,
+            yh, had_u, interm_g, interm_u, interm_a, out_d, coop_ctr, out_bszn,
+            sh_w, coop_K_gu, coop_K_d, coop_cb
+        );
+        coop_p.min_expert = min_expert;
+        coop_p.max_expert = max_expert;
+    }
+
+#if defined(USE_ROCM)
+    {
+        // Bit width code of the RDNA GEMVs: integer K, or EXL3_HALF_BITS(k) for a k + 0.5 mul1 rate; 0 = none
+        auto kcode = [&] (float K) -> int
+        {
+            const int k = (int) K;
+            if ((float) k == K) return k;
+            if (up_mul1 && K - (float) k == 0.5f && k >= 1 && k <= 3 && exl3_rocm_half_gemv_enabled())
+                return EXL3_HALF_BITS(k);
+            return 0;
+        };
+        rdna_K_gu = kcode(up_K);
+        rdna_K_d = kcode(down_K);
+        rdna_cb = up_mul1 ? 2 : up_mcg ? 1 : 0;
+        // EXL3_ROCM_MOE_DECODE=0 keeps run_bszN on the kernels above
+        const char* env = std::getenv("EXL3_ROCM_MOE_DECODE");
+        rdna_moe = !(env && env[0] == '0')
+            && gated && act_silu && !act_gelu && !act_silu_oai && !act_relu2
+            && !gate_bias_ptrs && !up_bias_ptrs && !down_bias_ptrs
+            && min_expert < 0
+            && rdna_K_gu && rdna_K_d
+            && interm_gu.scalar_type() == at::kHalf && interm_a2.scalar_type() == at::kHalf
+            && out_d2.scalar_type() == at::kFloat;
+        if (rdna_moe)
+        {
+            rdna_gu_trellis = at::cat({gate_ptrs_trellis, up_ptrs_trellis}).contiguous();
+            rdna_gu_suh = at::cat({gate_ptrs_suh, up_ptrs_suh}).contiguous();
+            rdna_gu_svh = at::cat({gate_ptrs_svh, up_ptrs_svh}).contiguous();
+        }
+    }
+#endif
+
+    // Shared expert fused launch. The shared BC_GatedMLP carries its gate and up either as one
+    // merged pointer table (gu_ptrs_*: [gate, up], the multi-GEMM form) or as separate bound
+    // linears; the down projection is always a bound linear
+    if (_sh_coop && shared_experts && out_d_sh && shared_experts->down && (shared_experts->gu_ptrs_trellis || (shared_experts->gate && shared_experts->up)))
+    {
+        auto& se = shared_experts; auto& d = se->down;
+        auto dev = yh.device();
+        auto lopt = at::TensorOptions().dtype(at::kLong);
+        auto table = [&](const at::Tensor& t) { return at::tensor({(int64_t) t.data_ptr()}, lopt).to(dev); };
+        at::Tensor gt, gs, gv, ut, us, uv;
+        float Kgu; int Hi_sh, I_sh; bool mcg_gu, mul1_gu;
+        c10::optional<at::Tensor> gb, ub;
+        if (se->gu_ptrs_trellis)
+        {
+            gt = se->gu_ptrs_trellis->slice(0, 0, 1).contiguous(); ut = se->gu_ptrs_trellis->slice(0, 1, 2).contiguous();
+            gs = se->gu_ptrs_suh->slice(0, 0, 1).contiguous();     us = se->gu_ptrs_suh->slice(0, 1, 2).contiguous();
+            gv = se->gu_ptrs_svh->slice(0, 0, 1).contiguous();     uv = se->gu_ptrs_svh->slice(0, 1, 2).contiguous();
+            Kgu = se->gu_K; mcg_gu = se->gu_mcg; mul1_gu = se->gu_mul1;
+            Hi_sh = (int) se->guh.size(-1); I_sh = (int) se->gu.size(-1);
+        }
+        else
+        {
+            auto& g = se->gate; auto& u = se->up;
+            gt = table(g->trellis); gs = table(g->suh); gv = table(g->svh);
+            ut = table(u->trellis); us = table(u->suh); uv = table(u->svh);
+            Kgu = g->K; mcg_gu = u->mcg; mul1_gu = u->mul1;
+            Hi_sh = (int) g->trellis.size(0) * 16; I_sh = (int) g->trellis.size(1) * 16;
+            if (g->K != u->K || g->mcg != u->mcg || g->mul1 != u->mul1) Kgu = -1;
+            if (g->bias) gb = table(g->bias.value());
+            if (u->bias) ub = table(u->bias.value());
+        }
+        const int Ho_sh = (int) d->trellis.size(1) * 16;
+        const bool ok = Kgu >= 1 && Hi_sh % 128 == 0 && I_sh % 128 == 0 && Ho_sh % 128 == 0 &&
+                        (int) d->trellis.size(0) * 16 == I_sh && mcg_gu == d->mcg && mul1_gu == d->mul1 &&
+                        out_d_sh->size(-1) <= Ho_sh && (int) yh.size(-1) == Hi_sh;
+        if (ok)
+        {
+            at::Tensor dt = table(d->trellis), ds = table(d->suh), dv = table(d->svh);
+            c10::optional<at::Tensor> db;
+            if (d->bias) db = table(d->bias.value());
+            auto hopt = at::TensorOptions().dtype(at::kHalf).device(dev);
+            auto gopt = at::TensorOptions().dtype(interm_g.scalar_type()).device(dev);
+            at::Tensor had_g_sh = at::empty({MAX_BSZN, Hi_sh}, hopt), had_u_sh = at::empty({MAX_BSZN, Hi_sh}, hopt);
+            at::Tensor gu_g_sh = at::empty({MAX_BSZN, I_sh}, gopt), gu_u_sh = at::empty({MAX_BSZN, I_sh}, gopt);
+            at::Tensor act_out_sh = at::empty({MAX_BSZN, I_sh}, hopt);
+            at::Tensor d_out_sh = at::empty({MAX_BSZN, Ho_sh}, at::TensorOptions().dtype(at::kFloat).device(dev));
+            at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len(MAX_BSZN, MAX_BSZN, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
+            int act_sh = se->act_gelu ? MOE_COOP_ACT_GELU : se->act_relu2 ? MOE_COOP_ACT_RELU2 : MOE_COOP_ACT_SILU;
+            sh_coop_p = exl3_moe_coop_prepare
+            (
+                Hi_sh, gt, gs, gv, ut, us, uv, dt, ds, dv, gb, ub, db,
+                Kgu, Kgu, d->K, mcg_gu, mul1_gu, act_sh, se->act_limit, true,
+                had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh, out_d_sh.value(),
+                c10::nullopt, sh_K_gu, sh_K_d, sh_cb
+            );
+            sh_coop_p.min_expert = -1;
+            sh_coop_p.max_expert = -1;
+            sh_tables = { gt, gs, gv, ut, us, uv, dt, ds, dv, had_g_sh, had_u_sh, gu_g_sh, gu_u_sh, act_out_sh, d_out_sh, ctr_sh };
+            if (gb) sh_tables.push_back(gb.value());
+            if (ub) sh_tables.push_back(ub.value());
+            if (db) sh_tables.push_back(db.value());
+            sh_sel = at::zeros({MAX_BSZN, 1}, lopt.device(dev));
+            sh_rw = at::ones({MAX_BSZN, 1}, hopt);
+            sh_coop = true;
+        }
+    }
     for (int i = 0; i < max_tokens_per_expert; ++i)
     {
         interm_g_single.push_back(interm_g.squeeze(1).slice(0, 0, i + 1));
@@ -434,40 +446,6 @@ void BC_BlockSparseMLP::run_single_expert_gr
     at::Tensor ai = interm_a2.slice(0, 0, bsz);
     at::Tensor oi = out_d2.slice(0, 0, bsz);
 
-//    if (use_mgemm)
-//    {
-//        at::Tensor yb = y.unsqueeze(0);
-//        at::Tensor gui = interm_gu.slice(0, 0, bsz * 2).view({2, bsz, interm_gu.size(1)});
-//        at::Tensor yh2i = yh2.slice(0, 0, 2).view({2, 1, yh2.size(1)});
-//
-//        exl3_mgemm
-//        (
-//            yb,
-//            gu_trellis_ptr[expert_idx],
-//            gui,
-//            gu_suh_ptr[expert_idx],
-//            yh2,
-//            gu_svh_ptr[expert_idx],
-//            c10::nullopt,
-//            c10::nullopt,
-//            gate_K,
-//            -1,
-//            gate_mcg,
-//            gate_mul1,
-//            -1,
-//            -1,
-//            0
-//        );
-//
-//        at::Tensor gi = gui[0];
-//        at::Tensor ui = gui[1];
-//
-//        if (act_silu)
-//            silu_mul(gi, ui, ai, act_limit);
-//        else if (act_gelu)
-//            gelu_mul(gi, ui, ai, act_limit);
-//    }
-//    else
     {
         at::Tensor gi = interm_gu.slice(0, 0, bsz);
         at::Tensor ui = interm_gu.slice(0, bsz, bsz * 2);
@@ -558,9 +536,9 @@ void BC_BlockSparseMLP::run_single_expert
         {
             prepare_ctx(y.get_device());
 
-            graph_single[graphidx].capture_begin();
+            GraphCapture capture(graph_single[graphidx]);
             run_single_expert_gr(y, expert_idx, &graph_single[graphidx]);
-            graph_single[graphidx].capture_end();
+            capture.finish();
         }
 
         auto args = std::vector<PPTR>();
@@ -609,9 +587,9 @@ void BC_BlockSparseMLP::run_single_expert_dq
                        y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
 
         reconstruct(dq_temp_up, gates[expert_idx]->trellis, gate_K, gate_mcg, gate_mul1);
-        hgemm(yh1, dq_temp_up, interm1);
+        hgemm_recon(yh1, dq_temp_up, interm1);
         reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
-        hgemm(yh2, dq_temp_up, interm2);
+        hgemm_recon(yh2, dq_temp_up, interm2);
 
         had_r_128_dual(interm1, interm1, c10::nullopt, gates[expert_idx]->svh,
                        interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
@@ -620,7 +598,7 @@ void BC_BlockSparseMLP::run_single_expert_dq
     {
         had_r_128(y, yh2, ups[expert_idx]->suh, c10::nullopt, 1.0);
         reconstruct(dq_temp_up, ups[expert_idx]->trellis, up_K, up_mcg, up_mul1);
-        hgemm(yh2, dq_temp_up, interm2);
+        hgemm_recon(yh2, dq_temp_up, interm2);
         had_r_128(interm2, interm2, c10::nullopt, ups[expert_idx]->svh, 1.0);
     }
 
@@ -637,6 +615,6 @@ void BC_BlockSparseMLP::run_single_expert_dq
 
     had_r_128(interm_a, interm_a, downs[expert_idx]->suh, c10::nullopt, 1.0);
     reconstruct(dq_temp_down, downs[expert_idx]->trellis, down_K, down_mcg, down_mul1);
-    hgemm(interm_a, dq_temp_down, out);
+    hgemm_recon(interm_a, dq_temp_down, out);
     had_r_128(out, out, c10::nullopt, downs[expert_idx]->svh, 1.0);
 }

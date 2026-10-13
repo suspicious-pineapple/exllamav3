@@ -2,6 +2,7 @@ from __future__ import annotations
 from .generator import Generator
 from .job import Job
 import asyncio
+import torch
 
 # Sentinel pushed to an AsyncJob's queue on cancellation so a consumer parked in queue.get() wakes up and
 # exits, rather than waiting forever for results that will no longer be produced
@@ -33,14 +34,7 @@ class AsyncGenerator:
                 # consumer (e.g. a disconnected client that stopped draining its queue) would wedge the whole
                 # generator (issue #227).
                 results = self.generator.iterate()
-                for result in results:
-                    job = result["job"]
-                    async_job = self.jobs.get(job)
-                    if not async_job:
-                        continue
-                    async_job.put_result(result)
-                    if result["eos"]:
-                        del self.jobs[job]
+                self.deliver_results(results)
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
                 # generator iterations, even if the synchronous generator immediately has more work available.
@@ -59,6 +53,30 @@ class AsyncGenerator:
                 async_job.put_result(e)
             self.jobs.clear()
 
+    def deliver_results(self, results):
+        """
+        Fan generator results out to the owning AsyncJob queues. Missing jobs can happen if a job
+        was cancelled after iterate() started. Delivery must never block: this single task serves
+        every job, so waiting on one stalled consumer would wedge the whole generator (issue #227).
+        """
+        for result in results:
+            job = result["job"]
+            async_job = self.jobs.get(job)
+            if not async_job:
+                continue
+            if result.get("stage") == "error":
+                # Per-job failure contained by Generator.reap_failed_job. The raw exception
+                # must go into the queue as an exception object, not as a result dict:
+                # __aiter__ re-raises queued exceptions, which the server surfaces as an
+                # error for this request. A dict here would instead stream as a clean
+                # (empty) completion.
+                async_job.put_result(result["error"])
+                del self.jobs[job]
+                continue
+            async_job.put_result(result)
+            if result["eos"]:
+                del self.jobs[job]
+
     def enqueue(self, job: AsyncJob):
         # The iteration task died on a generator exception; surface it to the new job's consumer immediately
         if self.error is not None:
@@ -69,7 +87,13 @@ class AsyncGenerator:
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
         self.jobs[job.job] = job
-        self.generator.enqueue(job.job)
+        try:
+            self.generator.enqueue(job.job)
+        except Exception:
+            # A rejected job (e.g. too long for the cache) must not stay tracked: it would never produce a
+            # result, and a non-empty job map keeps the iteration loop spinning instead of idling
+            del self.jobs[job.job]
+            raise
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.
@@ -93,6 +117,10 @@ class AsyncGenerator:
         for async_job in self.jobs.values():
             async_job.put_result(_CANCELLED_SENTINEL)
         self.jobs.clear()
+
+        # Release what the sync generator holds on the host (recurrent checkpoints, the CPU page cache
+        # tier, pinned buffers) now: the failed jobs and their tracebacks can keep it reachable for a while
+        self.generator.close()
 
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop
@@ -145,6 +173,34 @@ class AsyncJob:
             yield result
             if result["eos"]:
                 break
+
+    def constrain_output_now(self, output: str | torch.Tensor):
+        """
+        Inject a fixed token string into the job's output stream; see Job.constrain_output_now. Safe to
+        call from any coroutine on the generator's event loop. Note that tokens already sampled by the
+        shared iteration task but still queued for this consumer precede the injection in the stream.
+        """
+        self.job.constrain_output_now(output)
+
+    def set_sampler(self, sampler):
+        """
+        Replace the sampler mid-generation; see Job.set_sampler. Safe to call from any coroutine on the
+        generator's event loop, including the body of an `async for` over this job. Results already queued
+        for this consumer were sampled before the change.
+        """
+        self.job.set_sampler(sampler)
+
+    def set_filters(self, filters):
+        """
+        Replace the filters mid-generation; see Job.set_filters and set_sampler above.
+        """
+        self.job.set_filters(filters)
+
+    def set_banned_strings(self, banned_strings):
+        """
+        Replace the banned strings mid-generation; see Job.set_banned_strings and set_sampler above.
+        """
+        self.job.set_banned_strings(banned_strings)
 
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,

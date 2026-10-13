@@ -15,6 +15,7 @@ constexpr float NEG_INF_F32 = -std::numeric_limits<float>::infinity();
 
 inline __device__ float gumbel(float x)
 {
+    x = fminf(x, 0.99999994f);  // curand_uniform is (0, 1]: x == 1.0 would produce a huge spike
     return -__logf(fmaxf(-__logf(fmaxf(x, 1e-20)), 1e-20));
 }
 
@@ -53,10 +54,23 @@ inline __device__ bool read2f
     }
     else
     {
-        half2 x0x1 = *((half2*) (logits_ptr + idx));
-        if (idx < max_logit - 1) x0 = __half2float(__low2half(x0x1));
+        // Pairwise load only where the pair is 4-byte aligned and inside the row: rows of odd length start at odd
+        // element offsets in a batch, and the last pair of such a row holds a single element
+        half h0, h1;
+        if (idx + 1 < num_logits && !((uintptr_t) (logits_ptr + idx) & 3))
+        {
+            half2 x0x1 = *((half2*) (logits_ptr + idx));
+            h0 = __low2half(x0x1);
+            h1 = __high2half(x0x1);
+        }
+        else
+        {
+            h0 = logits_ptr[idx];
+            h1 = idx + 1 < num_logits ? logits_ptr[idx + 1] : __float2half(0.0f);
+        }
+        if (idx < max_logit) x0 = __half2float(h0);           // element idx
         else x0 = NEG_INF_F32;
-        if (idx < max_logit) x1 = __half2float(__high2half(x0x1));
+        if (idx + 1 < max_logit) x1 = __half2float(h1);       // element idx + 1
         else x1 = NEG_INF_F32;
         return true;
     }
@@ -103,8 +117,9 @@ void gumbel_sample_kernel
     const half* logits_ptr = logits + num_logits * blockIdx.x;
     uint64_t* ids_ptr = ids + blockIdx.x;
 
+    // One Philox subsequence per (row, thread), so the rows of a batch draw independent noise
     curandStatePhilox4_32_10_t state;
-    curand_init(random, threadIdx.x, 0, &state);
+    curand_init(random, (unsigned long long) blockIdx.x * NUM_THREADS + threadIdx.x, 0, &state);
 
     ValIdx maxvi = { NEG_INF_F32, 0 };
     int idx = threadIdx.x * 2;
@@ -134,7 +149,8 @@ void common
     at::Tensor& ids,
     int& bsz,
     int& num_logits,
-    int& max_logit
+    int& max_logit,
+    const char* fn
 )
 {
     TORCH_CHECK_DIM(logits, 2);
@@ -146,6 +162,7 @@ void common
     bsz = logits.size(0);
     num_logits = logits.size(1);
     if (max_logit > num_logits) max_logit = num_logits;
+    TORCH_CHECK(max_logit > 0, fn, ": sampling over an empty vocabulary");
 }
 
 void argmax_sample
@@ -161,7 +178,8 @@ void argmax_sample
     if (!max_logit) max_logit = logits.size(-1);
 
     int bsz, num_logits;
-    common(logits, ids, bsz, num_logits, max_logit);
+    common(logits, ids, bsz, num_logits, max_logit, "argmax_sample");
+    if (!bsz) return;
     argmax_sample_kernel<<<bsz, NUM_THREADS, 0, stream>>>
     (
         (const half*) logits.data_ptr(),
@@ -169,6 +187,7 @@ void argmax_sample
         num_logits,
         max_logit
     );
+    cuda_check(cudaPeekAtLastError());
 }
 
 void gumbel_sample
@@ -185,7 +204,8 @@ void gumbel_sample
     if (!max_logit) max_logit = logits.size(-1);
 
     int bsz, num_logits;
-    common(logits, ids, bsz, num_logits, max_logit);
+    common(logits, ids, bsz, num_logits, max_logit, "gumbel_sample");
+    if (!bsz) return;
     gumbel_sample_kernel<<<bsz, NUM_THREADS, 0, stream>>>
     (
         (const half*) logits.data_ptr(),
@@ -194,4 +214,5 @@ void gumbel_sample
         max_logit,
         random
     );
+    cuda_check(cudaPeekAtLastError());
 }

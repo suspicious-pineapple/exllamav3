@@ -6,9 +6,11 @@ import numpy as np
 from ..model.config import Config
 from . import Module
 from .quant import LinearFP16, LinearEXL3
-from .quant.exl3_lib import quantize_exl3
+from .quant.exl3_lib import quantize_exl3, quantize_exl3_batch
+from .quant.exl3_lib.quantize import codebook_mcg_mult, codebook_mul1_mult
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
+from ..util.pinned_arena import PinnedArena
 
 # MXFP4 (e2m1 + e8m0 block scale) as stored by gpt-oss: each 16-byte block packs 32 fp4 values
 # (low nibble first), one power-of-two scale byte per block
@@ -45,6 +47,7 @@ class Linear(Module):
         frange_dim: int = 0,
         fidx: int | None = None,
         finterleaved: bool = False,
+        fdequant = None,
         caps: dict = None,
         softcap: float = 0.0,
         pad_to: int = 128,
@@ -55,7 +58,9 @@ class Linear(Module):
         first_out_feature: int | None = None,
         out_dtype: torch.dtype | None = None,
         allow_input_padding: bool = False,
+        pre_scale: float = 1.0,
         post_scale: float = 1.0,
+        weight_scale: float = 1.0,
         transposed_load: bool = True,
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
@@ -81,11 +86,16 @@ class Linear(Module):
         self.frange_dim = frange_dim
         self.fidx = fidx
         self.finterleaved = finterleaved
+        # Optional architecture-supplied reader for the fused checkpoint tensor named by fkey.
+        # Signature: (stc, fkey, device) -> fp16 (out_features, in_features) tensor
+        self.fdequant = fdequant
         self.quant_type = None
         self.softcap = softcap
         self.is_sliced = self.in_features < self.full_in_features or self.out_features < self.full_out_features
         self.out_dtype = out_dtype
+        self.pre_scale = pre_scale
         self.post_scale = post_scale
+        self.weight_scale = weight_scale
         self.transposed_load = transposed_load
         self.transpose_fused_weights = transpose_fused_weights
         self.ftranspose_after_load = ftranspose_after_load
@@ -151,6 +161,32 @@ class Linear(Module):
         return weight.view(ws).half()
 
 
+    # DeepSeek-V4-style quantized checkpoint tensors, dequantized to FP16 at load (they get
+    # requantized to EXL3 anyway; no runtime paths for exotic dtypes). One generic routine:
+    # the block shape is derived from the scale grid, covering FP8 E4M3 with a [128, 128]
+    # grid and packed FP4 (two e2m1 nibbles per int8 byte, low nibble first) with a [1, 32]
+    # grid. E8M0 scales arrive as uint8 exponent bytes, value 2^(byte - 127). Mirrors the
+    # transformers finegrained_fp8 reference dequant.
+    def dequant_e8m0_blocks_(self, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        # MiMo-V2 stores the same packed-FP4 expert weights as U8 rather than I8; the bytes are
+        # identical (SGLang's loader only bitcasts to match its int8 parameter, then masks as
+        # unsigned again), so both dtypes take the unpack path
+        if weight.dtype in (torch.int8, torch.uint8):
+            u8 = weight.contiguous().view(torch.uint8)
+            lut = torch.tensor(_MXFP4_LUT, dtype = torch.float, device = weight.device)
+            w = torch.stack((lut[(u8 & 0x0F).long()], lut[(u8 >> 4).long()]), dim = -1)
+            w = w.view(weight.shape[0], -1)
+        else:
+            w = weight.float()
+        rows, cols = w.shape
+        sr, sc = scale.shape
+        assert rows % sr == 0 and cols % sc == 0, \
+            f"{self.key}: weight {rows}x{cols} not divisible by scale grid {sr}x{sc}"
+        s = (scale.float() - 127.0).exp2() if scale.dtype == torch.uint8 else scale.float()
+        w = (w.view(sr, rows // sr, sc, cols // sc) * s.view(sr, 1, sc, 1)).view(rows, cols)
+        return w.half()
+
+
     def load_fp16(self, key: str | list[str]) -> bool:
 
         if self.config.stc.has_tensor_group(key, ["weight"]):
@@ -166,16 +202,43 @@ class Linear(Module):
                 dev = "cpu" if self.is_sliced else self.device
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
-                scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-                scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
-                assert scale is None or scale_inv is None
-                no_defer = scale is not None or scale_inv is not None
-                weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
-                bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+                scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
+                if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
+                    # MiMo-V2 routed experts: same E8M0 block grid, named "weight_scale" and
+                    # stored as U8 exponent bytes. Only 2D uint8 scales route here; float
+                    # "weight_scale" tensors keep the per-row/per-tensor fp8 path below. Fetched
+                    # untransposed because the dequant runs in checkpoint (out, in) orientation
+                    ws_q = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+                    if ws_q is not None and ws_q.dim() == 2 and ws_q.dtype == torch.uint8:
+                        scale_q = ws_q
+                if scale_q is not None and scale_q.dim() == 2:
+                    # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
+                    # orientation (out, in); dequant first, then orient/pad like a plain load
+                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True, arena = False)
+                    weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
+                    if self.transposed_load:
+                        weight = weight.T
+                    weight = weight.contiguous() if self.is_sliced else self.pad_out(weight.contiguous())
+                    bias = None
+                    scale = scale_inv = None
+                else:
+                    scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
+                    assert scale is None or scale_inv is None
+                    # Scaled loads are rewritten into a new tensor below: keep the raw load out of
+                    # the loader's slab blocks, where the dead copy would otherwise stay resident
+                    rescaled = scale is not None or scale_inv is not None or self.weight_scale != 1.0
+                    no_defer = rescaled
+                    weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer, arena = not rescaled)
+                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer, arena = not rescaled)
                 if scale is not None:
                     weight = self.apply_fp8_scales_(weight, scale)
                 elif scale_inv is not None:
                     weight = self.apply_fp8_scales_inv_(weight, scale_inv)
+                if self.weight_scale != 1.0:
+                    weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                    if bias is not None:
+                        bias = (bias.float() * self.weight_scale).to(bias.dtype)
 
             self.inner = LinearFP16(
                 self.in_features,
@@ -206,6 +269,16 @@ class Linear(Module):
                 no_defer = True,
                 fidx = self.fidx
             )
+            if weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # fp8 batch tensor (Mistral-Small-4): per-expert scalar scale stored as
+                # {fkey}_scale_inv with the expert on the first dim
+                scale_inv = self.config.stc.get_tensor(
+                    self.fkey + "_scale_inv", self.device, optional = True, no_defer = True, fidx = self.fidx
+                )
+                weight = weight.float()
+                if scale_inv is not None:
+                    weight = weight * scale_inv.float().reshape(-1)[0]
+                weight = weight.half()
             if self.frange is not None:
                 if self.frange_dim == 0:
                     weight = weight[self.frange[0] : self.frange[1]].contiguous()
@@ -217,6 +290,8 @@ class Linear(Module):
                 weight = weight.T.contiguous()
             # pad_out expects (in_features, out_features) orientation
             weight = self.pad_out(weight)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -265,6 +340,10 @@ class Linear(Module):
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
             bias = self.pad_out(bias)
+            if self.weight_scale != 1.0:
+                weight = (weight.float() * self.weight_scale).to(weight.dtype)
+                if bias is not None:
+                    bias = (bias.float() * self.weight_scale).to(bias.dtype)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -282,19 +361,33 @@ class Linear(Module):
 
         elif self.fkey and self.config.stc.has_tensor_group(self.fkey, ["weight"]) and self.frange is not None:
 
-            weight = self.config.stc.get_tensor(
-                self.fkey + ".weight",
-                self.device,
-                no_defer = True
-            )
+            if self.fdequant is not None:
+                # Architecture-supplied reader for a fused tensor whose checkpoint layout the
+                # generic paths cannot describe (MiMo-V2: TP-shard-interleaved fused QKV with a
+                # per-shard, ceiling-padded FP8 scale grid). Returns the canonical, contiguous
+                # (out_features, in_features) fp16 matrix that frange indexes into
+                weight = self.fdequant(self.config.stc, self.fkey, self.device)
+                bias = None
+            else:
+                weight = self.config.stc.get_tensor(
+                    self.fkey + ".weight",
+                    self.device,
+                    no_defer = True
+                )
+                # Fused checkpoint tensor in FP8/FP4-block form (DeepSeek-V4 wo_a): dequantize the
+                # whole tensor before slicing out this group's rows
+                scale_q = self.config.stc.get_tensor(self.fkey + ".scale", self.device, optional = True, no_defer = True)
+                if scale_q is not None and scale_q.dim() == 2:
+                    weight = self.dequant_e8m0_blocks_(weight, scale_q)
             weight = weight[self.frange[0] : self.frange[1]].contiguous()
             weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(
-                self.fkey + ".bias",
-                self.device,
-                optional = True,
-                no_defer = True
-            )
+            if self.fdequant is None:
+                bias = self.config.stc.get_tensor(
+                    self.fkey + ".bias",
+                    self.device,
+                    optional = True,
+                    no_defer = True
+                )
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
                 bias = self.pad_out(bias)
@@ -328,15 +421,21 @@ class Linear(Module):
         if not self.is_exl3_storage(key):
             return False
         self.used_alt_key = key == self.alt_key
-        scale = self.config.stc.get_tensor(key + ".scale", self.device, optional = True)
-        su = self.config.stc.get_tensor(key + ".su", self.device, optional = True, no_defer = True)
-        suh = self.config.stc.get_tensor(key + ".suh", self.device, optional = True)
-        sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
-        svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
-        trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
-        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", optional = True)
-        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", optional = True)
-        bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
+        # Probe the header before fetching: most formats ship only a subset of these tensors,
+        # and the misses otherwise add up to a significant share of bulk-load Python overhead
+        stc = self.config.stc
+        def opt(subkey, device, **kwargs):
+            k = key + subkey
+            return stc.get_tensor(k, device, optional = True, **kwargs) if stc.has_tensor(k) else None
+        scale = None  # opt(".scale", self.device)
+        su = opt(".su", self.device, no_defer = True)
+        suh = opt(".suh", self.device)
+        sv = opt(".sv", self.device, no_defer = True)
+        svh = opt(".svh", self.device)
+        trellis = stc.get_tensor(key + ".trellis", self.device)
+        mcg = stc.get_codebook_marker(key + ".mcg", codebook_mcg_mult)
+        mul1 = stc.get_codebook_marker(key + ".mul1", codebook_mul1_mult)
+        bias = opt(".bias", self.device)
         self.inner = LinearEXL3(
             self.config,
             self.in_features,
@@ -373,6 +472,41 @@ class Linear(Module):
         if any(self.load_fp16(k) for k in keys): return
         raise ValueError(f"No tensors found for {self.key} matching supported quantization format.")
 
+
+    @override
+    def pin_linears(self):
+        """Move this layer's bulk weight storage (fp16 weight or EXL3 trellis) to pinned host
+        memory and swap in a zero-copy CUDA alias, freeing the VRAM. Compute paths read the
+        weights over PCIe: fine for occasional, compute-bound vision-tower batches. Small
+        tensors (bias, suh/svh) stay in VRAM. Runs post-load, so it covers every load flavor
+        (fused/sliced/fp8-dequant) and deferred fills have already landed."""
+        inner = self.inner
+        if inner is None or self.device is None:
+            return
+        device = torch.device(self.device)
+        if device.type != "cuda":
+            return
+
+        def pin_alias(t):
+            # An arena of the tensor's own size rather than a tensor from torch's pinned allocator, which
+            # rounds each request up to a power of two and keeps the block after the tower is unloaded
+            if not t.is_contiguous():
+                t = t.contiguous()
+            nbytes = t.numel() * t.element_size()
+            inner._pinned_arena = PinnedArena(nbytes, f"Pinned weights of {self.key}", mapped = True, required = True)
+            p = inner._pinned_arena.tensor[:nbytes].view(t.dtype).view(t.shape)
+            p.copy_(t)
+            return p, ext.pinned_cuda_view(p, device.index if device.index is not None else 0)
+
+        if isinstance(inner, LinearFP16) and inner.swap_device is None:
+            inner._pinned_store, inner.weight = pin_alias(inner.weight)
+            inner.bc = ext.BC_LinearFP16(inner.weight, inner.bias)
+        elif isinstance(inner, LinearEXL3):
+            from ..util.tensor import g_tensor_cache
+            inner._pinned_store, inner.trellis = pin_alias(inner.trellis)
+            inner.bc = ext.BC_LinearEXL3(
+                inner.trellis, inner.suh, inner.svh, inner.K, inner.bias,
+                inner.mcg, inner.mul1, g_tensor_cache.get(*inner.bsz1_xh_args))
 
     @override
     def unload(self):
@@ -472,6 +606,14 @@ class Linear(Module):
             dim = x.shape[-1]
             x = x.view((rows, dim)).to(torch.float, copy = True)  # TODO: Why copy here?
 
+            # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
+            # accumulation, and no diagonal damping can repair non-finite entries afterwards.
+            # Drop the affected rows; the inf_nan counter above still reports them
+            finite = torch.isfinite(x).all(dim = 1)
+            if not finite.all():
+                x = x[finite]
+                rows = x.shape[0]
+
             params["capture"][self.qmap]["H"].addmm_(x.T, x)
             params["capture"][self.qmap]["count"] += rows
 
@@ -519,6 +661,8 @@ class Linear(Module):
         if lora_input is not None:
             self.apply_lora(lora_input, x)
 
+        if self.pre_scale != 1.0:
+            x *= self.pre_scale
         if self.softcap != 0.0:
             ext.softcap(x, x, self.softcap)
         if self.post_scale != 1.0:
@@ -604,6 +748,7 @@ class Linear(Module):
                 "full_out_features": self.full_out_features,
                 "first_in_feature": self.first_in_feature,
                 "first_out_feature": self.first_out_feature,
+                "pre_scale": self.pre_scale,
                 "post_scale": self.post_scale,
             },
             # Not constructor args: restored post-construction by _adopt_inner_dims for dims the
@@ -708,3 +853,53 @@ class Linear(Module):
         assert unit == "channels"
         split = (True, first, last) if first is not None else None
         return Linear.tp_import_split(local_context, exported, plan, split)
+
+
+def convert_exl3_group(
+    linears: list,
+    H_datas: list[dict],
+    quant_args_list: list[dict],
+    progress_str: str | None = None,
+):
+    """
+    Convert a group of Linear modules to EXL3 in one batched quantization pass (see quantize_exl3_batch for
+    the grouping requirements: shared Hessian with equal in_features, or same-shape tensors with individual
+    Hessians, all at the same bitrate).
+
+    :return:
+        list of proxy errors, one per module; each module's quant_args dict in quant_args_list is updated
+        the same way Linear.convert_exl3 updates its quant_args
+    """
+    weights = []
+    biases = []
+    for linear in linears:
+        assert isinstance(linear.inner, LinearFP16), \
+            "Inner layer is already quant type"
+        # Checkpoint precision, usually still swapped to CPU: quantize_exl3_batch stages the
+        # upload through pinned memory and casts to fp32 on the device
+        weights.append(linear.inner.get_weight_tensor())
+        biases.append(linear.inner.get_bias_tensor())
+        linear.inner = None
+
+    results = quantize_exl3_batch(weights, H_datas, quant_args_list, progress_str)
+
+    proxy_errs = []
+    for linear, bias, (proxy_err, out_tensors) in zip(linears, biases, results):
+        linear.inner = LinearEXL3(
+            linear.config,
+            linear.in_features,
+            linear.out_features,
+            out_tensors.get("scale"),
+            out_tensors.get("su"),
+            out_tensors.get("sv"),
+            out_tensors.get("suh"),
+            out_tensors.get("svh"),
+            out_tensors.get("trellis"),
+            out_tensors.get("mcg"),
+            out_tensors.get("mul1"),
+            bias,
+            linear.out_dtype,
+            key = linear.key
+        )
+        proxy_errs.append(proxy_err)
+    return proxy_errs

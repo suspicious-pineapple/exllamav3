@@ -3,30 +3,18 @@ import os
 
 import torch
 
-try:
-    import triton
-    import triton.language as tl
-    has_triton = True
-except ImportError:
-    has_triton = False
-
-    # Triton dummy functions so import doesn't break if Triton is unavailable
-    class _DummyTritonLanguage:
-        constexpr = object()
-
-    class _DummyTriton:
-        @staticmethod
-        def jit(fn):
-            return fn
-
-    triton = _DummyTriton()
-    tl = _DummyTritonLanguage()
+import triton
+import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
+from .smem import pick_config, shared_bytes, tile_ladder, halving_ladder
+from ...util.backend import ROCM, gfx_arch, attn_decode_config
 
 
 def _is_power_of_2(x: int) -> bool:
     return x > 0 and (x & (x - 1)) == 0
+
+
 
 
 @triton.jit
@@ -62,6 +50,70 @@ def _paged_kv_update_kernel(
     mask = offs_d < head_dim
     tl.store(k_cache + dst, tl.load(k + src, mask=mask, other=0.0), mask=mask)
     tl.store(v_cache + dst, tl.load(v + src, mask=mask, other=0.0), mask=mask)
+
+
+# Row-tiled variant of the append above for the eager paths. For one token, all kv heads form one contiguous
+# n_kv_heads * head_dim row in both the source [bsz, len, n_kv, hd] and the cache [pages, page_size, n_kv, hd],
+# so a program copies BLOCK_T tokens x the whole row with one page lookup per token, instead of one small program
+# per (token, kv head). A pure copy: the cache contents are identical. _paged_kv_update_kernel stays for bc_attn,
+# which AOT-compiles it for the graph path
+@triton.jit
+def _paged_kv_update_rows_kernel(
+    k,
+    v,
+    k_cache,
+    v_cache,
+    block_table,
+    cache_seqlens,
+    num_pages_per_seq,
+    kv_append_len,
+    t_blocks,
+    ROW: tl.constexpr,
+    page_size: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    batch = pid // t_blocks
+    t = (pid - batch * t_blocks) * BLOCK_T + tl.arange(0, BLOCK_T)
+    tmask = t < kv_append_len
+    logical_t = tl.load(cache_seqlens + batch) + t
+    page = logical_t // page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page, mask=tmask, other=0)
+    dst_row = (phys.to(tl.int64) * page_size + (logical_t - page * page_size)) * ROW
+    src_row = (batch * kv_append_len + t).to(tl.int64) * ROW
+    for w0 in tl.static_range(0, ROW, BLOCK_W):
+        w = w0 + tl.arange(0, BLOCK_W)
+        m = tmask[:, None] & (w < ROW)[None, :]
+        src = src_row[:, None] + w[None, :]
+        dst = dst_row[:, None] + w[None, :]
+        tl.store(k_cache + dst, tl.load(k + src, mask=m), mask=m)
+        tl.store(v_cache + dst, tl.load(v + src, mask=m), mask=m)
+
+
+def _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                     n_kv_heads, page_size, head_dim):
+    """Append kv_append_len new tokens per sequence to the paged cache (eager paths)"""
+    if all(t.is_contiguous() for t in (k, v, k_cache, v_cache, block_table)):
+        row = n_kv_heads * head_dim
+        # Tokens per program and warps: gfx1100 prefers smaller token tiles over more warps
+        block_t, warps = (4, 8) if gfx_arch(k.device) == "gfx1100" else (_KV_UPDATE_BLOCK_T, _KV_UPDATE_WARPS)
+        t_blocks = triton.cdiv(kv_append_len, block_t)
+        _paged_kv_update_rows_kernel[(bsz * t_blocks,)](
+            k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, kv_append_len, t_blocks,
+            row, page_size, block_t, min(1024, triton.next_power_of_2(row)),
+            num_warps=warps,
+        )
+    else:
+        update_block_d = triton.next_power_of_2(head_dim)
+        _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
+            k, v, k_cache, v_cache, block_table, cache_seqlens,
+            num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
+            num_warps=2, num_stages=3,
+        )
+
+_KV_UPDATE_BLOCK_T = 8
+_KV_UPDATE_WARPS = 4
 
 
 @triton.jit
@@ -361,9 +413,6 @@ def paged_attn_triton(
     q/k/v are [batch, seq, heads, dim], caches are [pages, page_size, kv_heads, dim],
     block_table is [batch, pages_per_seq], and cache_seqlens is the pre-append length.
     """
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
     _check_tensor("k_cache", k_cache)
     _check_tensor("v_cache", v_cache)
@@ -433,24 +482,8 @@ def paged_attn_triton(
 
     with torch.cuda.device(q.device):
         if k is not None and kv_append_len:
-            update_block_d = triton.next_power_of_2(head_dim)
-            update_grid = (bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))
-            _paged_kv_update_kernel[update_grid](
-                k,
-                v,
-                k_cache,
-                v_cache,
-                block_table,
-                cache_seqlens,
-                num_pages_per_seq,
-                kv_append_len,
-                n_kv_heads,
-                page_size,
-                head_dim,
-                update_block_d,
-                num_warps=2,
-                num_stages=3,
-            )
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                             n_kv_heads, page_size, head_dim)
 
         q_blocks = triton.cdiv(q_len, block_m)
         attn_grid = (bsz * n_q_heads * q_blocks, triton.cdiv(head_dim, block_dv))
@@ -508,9 +541,6 @@ def paged_attn_triton_longq(
     num_stages: int = 1,
 ) -> torch.Tensor:
     """Long-query paged attention path that groups GQA sibling Q heads per program."""
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton_longq requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
     _check_tensor("k_cache", k_cache)
     _check_tensor("v_cache", v_cache)
@@ -585,23 +615,8 @@ def paged_attn_triton_longq(
     num_pages_per_seq = block_table.shape[1]
     with torch.cuda.device(q.device):
         if k is not None and kv_append_len:
-            update_block_d = triton.next_power_of_2(head_dim)
-            _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
-                k,
-                v,
-                k_cache,
-                v_cache,
-                block_table,
-                cache_seqlens,
-                num_pages_per_seq,
-                kv_append_len,
-                n_kv_heads,
-                page_size,
-                head_dim,
-                update_block_d,
-                num_warps=2,
-                num_stages=3,
-            )
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                             n_kv_heads, page_size, head_dim)
 
         group_size = n_q_heads // n_kv_heads
         grid0 = bsz * n_kv_heads * triton.cdiv(q_len, block_m) * triton.cdiv(group_size, block_h)
@@ -641,10 +656,11 @@ def paged_attn_triton_longq(
 
 def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
-        args.q_len > 256
+        args.q_len > 256 or
+        args.dim > 512 or
+        not _is_power_of_2(args.dim)
     ):
         return None
 
@@ -670,7 +686,6 @@ def fn_triton_paged_attn(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len <= 256 or
@@ -708,6 +723,23 @@ def fn_triton_paged_attn_longq(args: AttnArgs) -> torch.Tensor | None:
 
 _h32_cache = {}
 
+# EXL3_QC_STAGING selects how quantized caches feed the attention kernels:
+#   0 = no staging: online dequant inside the prefill and decode kernels. Lowest memory (no
+#       staging scratch is ever allocated or reserved during autosplit) but prefill pays the
+#       in-kernel expansion cost (~6-26% on the kernel depending on bitrate)
+#   1 = prefill staging (default): prefill dequantizes the referenced cache window once into a
+#       shared fp16 scratch sized for the full cache at bsz 1 and runs the fp16 kernel over it;
+#       decode stays online. The scratch is allocated on first use -- the autosplit measuring
+#       pass triggers it, so the space is reserved at load time
+#   2 = full staging: dispatch-path debug mode; whole layers are dequantized into full-size
+#       fp16 temporaries before attention (get_kv). Only affects decode if EXL3_BC_ATTN=0
+_qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
+
+# Query-length threshold for the prefill staging pass at EXL3_QC_STAGING=1: below it the direct
+# path reads less gmem (short trailing chunks over long contexts, low bitrates). Per device:
+# where the staged window feeds SDPA (sm_75) every prefill chunk stages (util/backend.py)
+from ...util.backend import qc_prefill_two_pass_min_q, sdpa_prefill as _sdpa_prefill
+
 def _get_h32(device):
     if device not in _h32_cache:
         h = torch.ones(1, 1, dtype = torch.float32)
@@ -727,67 +759,85 @@ def _rot_h32(x, h32, ROWS: tl.constexpr, head_dim: tl.constexpr):
 
 @triton.jit
 def _qc_plane_kt(qwords_head, row_words, mask_n, pbase,
-                 W: tl.constexpr, BITS: tl.constexpr, head_dim: tl.constexpr):
-    """One power-of-two bit plane, (head_dim, BLOCK_N) int32: compact coalesced word tile
+                 W: tl.constexpr, BITS: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    """One power-of-two bit plane, (HD_PAD, BLOCK_N) int32: compact coalesced word tile
     expanded with broadcast shifts. Groups of 32 values own BITS words each; this plane's
-    words sit at [pbase, pbase + W) within each group."""
+    words sit at [pbase, pbase + W) within each group. HD_PAD >= head_dim (a power of two)
+    pads a non-power-of-two head width with zero columns: words past the real width are
+    masked, so tl.arange stays a power of two."""
     WPH: tl.constexpr = head_dim * W // 32   # words per head slice in this plane
+    WPH_PAD: tl.constexpr = HD_PAD * W // 32
     VPW: tl.constexpr = 32 // W              # values per word
-    garr = tl.arange(0, WPH)
+    garr = tl.arange(0, WPH_PAD)
     cols = (garr // W) * BITS + pbase + (garr % W)
-    w = tl.load(qwords_head + row_words[None, :] + cols[:, None], mask = mask_n[None, :], other = 0)
+    if WPH_PAD > WPH:
+        w = tl.load(qwords_head + row_words[None, :] + cols[:, None],
+                    mask = mask_n[None, :] & (garr < WPH)[:, None], other = 0)
+    else:
+        w = tl.load(qwords_head + row_words[None, :] + cols[:, None], mask = mask_n[None, :], other = 0)
     nib = (w[:, None, :] >> (tl.arange(0, VPW) * W)[None, :, None]) & ((1 << W) - 1)
-    return tl.reshape(nib, (head_dim, w.shape[1]))
+    return tl.reshape(nib, (HD_PAD, w.shape[1]))
 
 
 @triton.jit
 def _qc_plane_v(qwords_head, row_words, mask_n, pbase,
-                W: tl.constexpr, BITS: tl.constexpr, head_dim: tl.constexpr):
-    """Transposed orientation of _qc_plane_kt: (BLOCK_N, head_dim)."""
+                W: tl.constexpr, BITS: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    """Transposed orientation of _qc_plane_kt: (BLOCK_N, HD_PAD)."""
     WPH: tl.constexpr = head_dim * W // 32
+    WPH_PAD: tl.constexpr = HD_PAD * W // 32
     VPW: tl.constexpr = 32 // W
-    garr = tl.arange(0, WPH)
+    garr = tl.arange(0, WPH_PAD)
     cols = (garr // W) * BITS + pbase + (garr % W)
-    w = tl.load(qwords_head + row_words[:, None] + cols[None, :], mask = mask_n[:, None], other = 0)
+    if WPH_PAD > WPH:
+        w = tl.load(qwords_head + row_words[:, None] + cols[None, :],
+                    mask = mask_n[:, None] & (garr < WPH)[None, :], other = 0)
+    else:
+        w = tl.load(qwords_head + row_words[:, None] + cols[None, :], mask = mask_n[:, None], other = 0)
     nib = (w[:, :, None] >> (tl.arange(0, VPW) * W)[None, None, :]) & ((1 << W) - 1)
-    return tl.reshape(nib, (w.shape[0], head_dim))
+    return tl.reshape(nib, (w.shape[0], HD_PAD))
 
 
 @triton.jit
 def _qc_load_kt(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
-                BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr):
-    """(head_dim, BLOCK_N) fp16 tile from the packed cache, linear midpoint grid, values stay
+                BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    """(HD_PAD, BLOCK_N) fp16 tile from the packed cache, linear midpoint grid, values stay
     in the rotated domain. The cache packs each group into power-of-two bit planes (BITS = sum
-    of its set bits), so every width expands with vectorized shifts; no gathers, no straddling."""
+    of its set bits), so every width expands with vectorized shifts; no gathers, no straddling.
+    head_dim must be a multiple of 32; HD_PAD (power of two >= head_dim) zero-pads the rest."""
     GPT: tl.constexpr = n_kv_heads * head_dim // 32
-    base = kv_head * ((head_dim // 32) * BITS)
+    G: tl.constexpr = head_dim // 32
+    G_PAD: tl.constexpr = HD_PAD // 32
+    base = kv_head * (G * BITS)
     row_words = tok_rows * (GPT * BITS)
     qh = qwords + base
     raw = tl.zeros((1, 1), tl.int32)  # replaced by first plane
     pbase = 0
     first = True
     if BITS & 8:
-        raw = _qc_plane_kt(qh, row_words, mask_n, pbase, 8, BITS, head_dim)
+        raw = _qc_plane_kt(qh, row_words, mask_n, pbase, 8, BITS, head_dim, HD_PAD)
         pbase += 8
         first = False
     if BITS & 4:
-        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 4, BITS, head_dim)
+        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 4, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 4) | p
         pbase += 4
         first = False
     if BITS & 2:
-        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 2, BITS, head_dim)
+        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 2, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 2) | p
         pbase += 2
         first = False
     if BITS & 1:
-        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 1, BITS, head_dim)
+        p = _qc_plane_kt(qh, row_words, mask_n, pbase, 1, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 1) | p
-    sgb = kv_head * (head_dim // 32)
-    sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + tl.arange(0, head_dim // 32))[:, None],
-                 mask = mask_n[None, :], other = 0.0)
-    scx = tl.reshape(tl.broadcast_to(sc[:, None, :], (head_dim // 32, 32, sc.shape[1])),
-                     (head_dim, sc.shape[1]))
+    sgb = kv_head * G
+    garr = tl.arange(0, G_PAD)
+    if G_PAD > G:
+        sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + garr)[:, None],
+                     mask = mask_n[None, :] & (garr < G)[:, None], other = 0.0)
+    else:
+        sc = tl.load(scales + tok_rows[None, :] * GPT + (sgb + garr)[:, None], mask = mask_n[None, :], other = 0.0)
+    scx = tl.reshape(tl.broadcast_to(sc[:, None, :], (G_PAD, 32, sc.shape[1])), (HD_PAD, sc.shape[1]))
     mh = (1 << (BITS - 1)) - 0.5
     inv_m = 1.0 / (1 << (BITS - 1))
     return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
@@ -795,40 +845,46 @@ def _qc_load_kt(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
 
 @triton.jit
 def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
-               BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr):
-    """(BLOCK_N, head_dim) fp16 tile, transposed orientation of _qc_load_kt."""
+               BITS: tl.constexpr, n_kv_heads: tl.constexpr, head_dim: tl.constexpr, HD_PAD: tl.constexpr):
+    """(BLOCK_N, HD_PAD) fp16 tile, transposed orientation of _qc_load_kt."""
     GPT: tl.constexpr = n_kv_heads * head_dim // 32
-    base = kv_head * ((head_dim // 32) * BITS)
+    G: tl.constexpr = head_dim // 32
+    G_PAD: tl.constexpr = HD_PAD // 32
+    base = kv_head * (G * BITS)
     row_words = tok_rows * (GPT * BITS)
     qh = qwords + base
     raw = tl.zeros((1, 1), tl.int32)
     pbase = 0
     first = True
     if BITS & 8:
-        raw = _qc_plane_v(qh, row_words, mask_n, pbase, 8, BITS, head_dim)
+        raw = _qc_plane_v(qh, row_words, mask_n, pbase, 8, BITS, head_dim, HD_PAD)
         pbase += 8
         first = False
     if BITS & 4:
-        p = _qc_plane_v(qh, row_words, mask_n, pbase, 4, BITS, head_dim)
+        p = _qc_plane_v(qh, row_words, mask_n, pbase, 4, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 4) | p
         pbase += 4
         first = False
     if BITS & 2:
-        p = _qc_plane_v(qh, row_words, mask_n, pbase, 2, BITS, head_dim)
+        p = _qc_plane_v(qh, row_words, mask_n, pbase, 2, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 2) | p
         pbase += 2
         first = False
     if BITS & 1:
-        p = _qc_plane_v(qh, row_words, mask_n, pbase, 1, BITS, head_dim)
+        p = _qc_plane_v(qh, row_words, mask_n, pbase, 1, BITS, head_dim, HD_PAD)
         raw = p if first else (raw << 1) | p
-    sgb = kv_head * (head_dim // 32)
-    sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + tl.arange(0, head_dim // 32))[None, :],
-                 mask = mask_n[:, None], other = 0.0)
-    scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], head_dim // 32, 32)),
-                     (sc.shape[0], head_dim))
+    sgb = kv_head * G
+    garr = tl.arange(0, G_PAD)
+    if G_PAD > G:
+        sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + garr)[None, :],
+                     mask = mask_n[:, None] & (garr < G)[None, :], other = 0.0)
+    else:
+        sc = tl.load(scales + tok_rows[:, None] * GPT + (sgb + garr)[None, :], mask = mask_n[:, None], other = 0.0)
+    scx = tl.reshape(tl.broadcast_to(sc[:, :, None], (sc.shape[0], G_PAD, 32)), (sc.shape[0], HD_PAD))
     mh = (1 << (BITS - 1)) - 0.5
     inv_m = 1.0 / (1 << (BITS - 1))
     return ((raw.to(tl.float32) - mh) * (scx.to(tl.float32) * inv_m)).to(tl.float16)
+
 
 @triton.jit
 def _paged_attn_decode_split_kernel(
@@ -855,6 +911,7 @@ def _paged_attn_decode_split_kernel(
     n_kv_heads: tl.constexpr,
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
+    HD_PAD: tl.constexpr,      # power of two >= head_dim: tile width, zero-padded columns
     scale: tl.constexpr,
     CAUSAL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -862,44 +919,56 @@ def _paged_attn_decode_split_kernel(
     SOFTCAP: tl.constexpr,
     FINAL: tl.constexpr,       # num_splits == 1: skip the combine pass, store directly to out
     HAS_SINKS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """Flash-decoding phase 1: one program per (batch, kv_head, h_block, kv split). GQA sibling
-    q heads and query positions share the row axis so K/V tiles are read once per group."""
+    """Flash-decoding phase 1: one program per (batch, kv_head, row block, kv split). The rows of a
+    kv head are its (query position, sibling q head) pairs packed densely (decode_row_layout), so a
+    program reads and dequantizes each K/V tile once for up to BLOCK_ROWS of them."""
     pid = tl.program_id(0)
     split = tl.program_id(1)
 
     group_size = n_q_heads // n_kv_heads
-    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_blocks = tl.cdiv(q_len * group_size, BLOCK_ROWS)
     h_block = pid % h_blocks
     bh = pid // h_blocks
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
     rows = tl.arange(0, BLOCK_ROWS)
-    row_q = rows % BLOCK_M
-    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    row_idx = h_block * BLOCK_ROWS + rows
+    row_q = row_idx % q_len
+    row_h_local = row_idx // q_len
     q_head = kv_head * group_size + row_h_local
-    valid_row = (row_q < q_len) & (row_h_local < group_size)
+    valid_row = row_idx < q_len * group_size
 
-    offs_d = tl.arange(0, head_dim)
+    offs_d = tl.arange(0, HD_PAD)
+    d_mask = offs_d < head_dim
     q_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
-    q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None], other=0.0)
+    q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None] & d_mask[None, :], other=0.0)
     if QCK > 0:
-        q_tile = _rot_h32(q_tile, h32, BLOCK_ROWS, head_dim)
+        q_tile = _rot_h32(q_tile, h32, BLOCK_ROWS, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
     q_abs = total_k_len - q_len + row_q
 
-    n_start = split * split_len
-    n_end = tl.minimum(n_start + split_len, total_k_len)
+    if WINDOW_LEFT >= 0:
+        # Sliding-window layers only need keys >= (first query position - window): split that range, not the whole
+        # sequence, across the programs. Splitting the sequence and skipping the tiles below the window leaves the
+        # window to the one or two splits that cover it (10x slower at 64K than at 16K for a 2048 window). The
+        # skipped keys carry exactly zero weight, so the result is unchanged
+        w_lo = tl.maximum(total_k_len - q_len - WINDOW_LEFT, 0)
+        w_lo = (w_lo // BLOCK_N) * BLOCK_N
+        w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
+        n_start = w_lo + split * w_span
+        n_end = tl.minimum(n_start + w_span, total_k_len)
+    else:
+        n_start = split * split_len
+        n_end = tl.minimum(n_start + split_len, total_k_len)
 
     m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_ROWS, head_dim), tl.float32)
+    acc = tl.zeros((BLOCK_ROWS, HD_PAD), tl.float32)
 
     for n0 in range(n_start, n_end, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
@@ -913,10 +982,13 @@ def _paged_attn_decode_split_kernel(
 
         if QCK > 0:
             tok_rows = phys * page_size + page_off
-            k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim)
+            k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim, HD_PAD)
         else:
             k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
-            k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < n_end, other=0.0)
+            if HD_PAD > head_dim:
+                k_tile = tl.load(k_ptrs, mask=(offs_n[None, :] < n_end) & d_mask[:, None], other=0.0)
+            else:
+                k_tile = tl.load(k_ptrs, mask=offs_n[None, :] < n_end, other=0.0)
         scores = tl.dot(q_tile, k_tile) * scale
         if SOFTCAP > 0.0:
             scores_scaled = scores / SOFTCAP
@@ -940,10 +1012,13 @@ def _paged_attn_decode_split_kernel(
 
         if QCV > 0:
             tok_rows_v = phys * page_size + page_off
-            v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim)
+            v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim, HD_PAD)
         else:
             v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            v_tile = tl.load(v_ptrs, mask=offs_n[:, None] < n_end, other=0.0)
+            if HD_PAD > head_dim:
+                v_tile = tl.load(v_ptrs, mask=(offs_n[:, None] < n_end) & d_mask[None, :], other=0.0)
+            else:
+                v_tile = tl.load(v_ptrs, mask=offs_n[:, None] < n_end, other=0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v_tile.dtype), v_tile)
         m = m_new
         l = l_new
@@ -957,13 +1032,13 @@ def _paged_attn_decode_split_kernel(
             l = l * alpha_s + tl.exp(sink - m_top)
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
-            out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, head_dim)
+            out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, HD_PAD)
         out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
-        tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
+        tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & d_mask[None, :])
     else:
         if split < num_splits:
-            po_base = (pid * num_splits + split) * BLOCK_ROWS * head_dim
-            tl.store(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :], acc)
+            po_base = (pid * num_splits + split) * BLOCK_ROWS * HD_PAD
+            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + offs_d[None, :], acc)
             ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
             tl.store(partial_ml + ml_base + rows * 2, m)
             tl.store(partial_ml + ml_base + rows * 2 + 1, l)
@@ -983,59 +1058,108 @@ def _paged_attn_decode_combine_kernel(
     n_q_heads: tl.constexpr,
     n_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_H: tl.constexpr,
+    HD_PAD: tl.constexpr,
+    V_DIM: tl.constexpr,       # output lanes per head (< head_dim when V rides zero-padded in the cache)
     BLOCK_ROWS: tl.constexpr,
+    ROWS_SUB: tl.constexpr,
+    D_SUB: tl.constexpr,
 ):
-    """Flash-decoding phase 2: reduce the per-split partial accumulators."""
+    """Flash-decoding phase 2: reduce the per-split partial accumulators. The output row is
+    written V_DIM wide per head: with an asymmetric V head dim the padded lanes are dropped
+    here, so the result feeds o_proj directly. Grid axis 1 splits
+    the program's (BLOCK_ROWS, HD_PAD) tile into (ROWS_SUB, D_SUB) sub-tiles so the serial
+    walk over the splits runs on many CTAs (decode launches only a few programs)."""
     pid = tl.program_id(0)
+    sub = tl.program_id(1)
+    D_CHUNKS: tl.constexpr = HD_PAD // D_SUB
+    r_c = sub // D_CHUNKS
+    d_c = sub - r_c * D_CHUNKS
 
     group_size = n_q_heads // n_kv_heads
-    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_blocks = tl.cdiv(q_len * group_size, BLOCK_ROWS)
     h_block = pid % h_blocks
     bh = pid // h_blocks
     batch = bh // n_kv_heads
     kv_head = bh - batch * n_kv_heads
 
-    rows = tl.arange(0, BLOCK_ROWS)
-    row_q = rows % BLOCK_M
-    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
+    # Same dense (query, head) rows as the split kernel
+    rows = r_c * ROWS_SUB + tl.arange(0, ROWS_SUB)
+    row_idx = h_block * BLOCK_ROWS + rows
+    row_q = row_idx % q_len
+    row_h_local = row_idx // q_len
     q_head = kv_head * group_size + row_h_local
-    valid_row = (row_q < q_len) & (row_h_local < group_size)
+    valid_row = row_idx < q_len * group_size
 
-    offs_d = tl.arange(0, head_dim)
+    offs_d = d_c * D_SUB + tl.arange(0, D_SUB)
+    d_mask = offs_d < head_dim
 
-    m_max = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        m_max = tl.maximum(m_max, m_s)
+    # Splits are walked S_BLK at a time as one masked tile load per pass: a scalar loop with a
+    # runtime trip count and no pipelining serializes a full load latency per split (65 splits
+    # at a 2K sparse context cost 20 us), a tile load amortizes it
+    S_BLK: tl.constexpr = 16
+    offs_s = tl.arange(0, S_BLK)
+    m_max = tl.full((ROWS_SUB,), -float("inf"), tl.float32)
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        m_max = tl.maximum(m_max, tl.max(m_s, axis=0))
 
     if HAS_SINKS:
         # Learned per-head sink joins the softmax denominator at the final reduction
         sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
         m_max = tl.maximum(m_max, sink)
 
-    l_sum = tl.zeros((BLOCK_ROWS,), tl.float32)
-    acc = tl.zeros((BLOCK_ROWS, head_dim), tl.float32)
+    l_sum = tl.zeros((ROWS_SUB,), tl.float32)
+    acc = tl.zeros((ROWS_SUB, D_SUB), tl.float32)
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
-    for s in range(num_splits):
-        ml_base = (pid * num_splits + s) * BLOCK_ROWS * 2
-        m_s = tl.load(partial_ml + ml_base + rows * 2)
-        l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
-        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe))
-        po_base = (pid * num_splits + s) * BLOCK_ROWS * head_dim
-        o_s = tl.load(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :])
-        acc += o_s * w[:, None]
-        l_sum += l_s * w
+    for s0 in range(0, num_splits, S_BLK):
+        sidx = s0 + offs_s
+        s_mask = sidx < num_splits
+        ml_idx = ((pid * num_splits + sidx)[:, None] * BLOCK_ROWS + rows[None, :]) * 2
+        m_s = tl.load(partial_ml + ml_idx, mask=s_mask[:, None], other=-float("inf"))
+        l_s = tl.load(partial_ml + ml_idx + 1, mask=s_mask[:, None], other=0.0)
+        w = tl.where(m_s == -float("inf"), 0.0, tl.exp(m_s - m_safe[None, :]))
+        po_idx = (pid * num_splits + sidx)[:, None, None] * (BLOCK_ROWS * HD_PAD) \
+            + rows[None, :, None] * HD_PAD + offs_d[None, None, :]
+        o_s = tl.load(partial_o + po_idx, mask=s_mask[:, None, None], other=0.0)
+        acc += tl.sum(o_s * w[:, :, None], axis=0)
+        l_sum += tl.sum(l_s * w, axis=0)
 
     if HAS_SINKS:
         l_sum += tl.exp(sink - m_safe)
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
-        out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, head_dim)
-    out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
-    tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
+        out_tile = _rot_h32(out_tile, h32, ROWS_SUB, D_SUB)   # 32-wide groups: D_SUB % 32 == 0
+    out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * V_DIM
+    tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None] & (offs_d < V_DIM)[None, :])
+
+
+def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, int]:
+    """(BLOCK_ROWS, row blocks per kv head) for the decode split / combine kernels.
+
+    A kv head's rows are its q_len * group_size (query position, sibling q head) pairs, packed densely
+    and cut into programs of up to 32 rows, each of which reads and dequantizes the head's K/V tiles
+    once. (Padding query positions up to a power of two and giving a program 16 / that many heads used
+    to split a 6-head group across three programs for a 5-token verify step, tripling the tile work.)
+    32 rows pays off at every head_dim up to 256 on Ampere, Blackwell and RDNA3 alike, the fp32
+    accumulator notwithstanding, since the tile loads dominate; at least 16 rows, the dots' minimum."""
+    rows = q_len * group_size
+    block_rows = max(16, min(32, triton.next_power_of_2(rows)))
+    return block_rows, triton.cdiv(rows, block_rows)
+
+
+def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+    """(ROWS_SUB, D_SUB) for the combine kernel: the smallest sub-tile whose h32 rotation still
+    forms a >= 16-row tl.dot (ROWS_SUB * D_SUB >= 512), D_SUB a multiple of 32."""
+    d_sub = min(128, hd_pad)
+    rows_sub = min(block_rows, max(1, 512 // d_sub))
+    while rows_sub * d_sub < 512 and d_sub < hd_pad:
+        d_sub *= 2
+    if rows_sub * d_sub < 512:
+        rows_sub, d_sub = block_rows, hd_pad
+    return rows_sub, d_sub
 
 
 _decode_sm_count = {}
@@ -1060,15 +1184,12 @@ def paged_attn_triton_decode(
     qc: tuple | None = None,            # (k_scales, v_scales, k_bits, v_bits): caches are packed int32
     pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
     n_kv_heads_override: int | None = None,
-    num_warps: int = 4,
-    num_stages: int = 2,
+    num_warps: int | None = None,
+    num_stages: int | None = None,
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
     second pass. GQA sibling q heads share K/V tiles within a program."""
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton_decode requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
     _check_tensor("block_table", block_table, None)
     _check_tensor("cache_seqlens", cache_seqlens, None)
@@ -1091,8 +1212,11 @@ def paged_attn_triton_decode(
         raise ValueError("q, caches, block_table and cache_seqlens must be on the same CUDA device")
     if n_q_heads % n_kv_heads != 0:
         raise ValueError("n_q_heads must be divisible by n_kv_heads")
-    if head_dim > 512 or not _is_power_of_2(head_dim):
-        raise ValueError("paged_attn_triton_decode currently supports power-of-two head_dim <= 512")
+    if head_dim > 512:
+        raise ValueError("paged_attn_triton_decode supports head_dim <= 512")
+    if qc is not None and head_dim % 32 != 0:
+        raise ValueError("quantized caches need head_dim to be a multiple of 32")
+    hd_pad = triton.next_power_of_2(head_dim)   # tile width; non-power-of-two dims are zero-padded
     if q_len > 16:
         raise ValueError("paged_attn_triton_decode supports q_len <= 16")
 
@@ -1121,14 +1245,17 @@ def paged_attn_triton_decode(
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    if block_n is None:
-        block_n = max(16, 8192 // head_dim)   # K + V tiles in smem across num_stages
+    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile. Tile and
+    # launch shape per backend / architecture (util/backend.py) unless the caller sets them
+    cfg_block_n, cfg_warps, cfg_stages = attn_decode_config(q.device, hd_pad)
+    if num_warps is None:
+        num_warps = cfg_warps
+    if num_stages is None:
+        num_stages = cfg_stages
+    candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
 
     group_size = n_q_heads // n_kv_heads
-    block_m = triton.next_power_of_2(q_len)
-    block_h = max(16 // block_m, 1)
-    block_rows = block_m * block_h
-    h_blocks = triton.cdiv(group_size, block_h)
+    block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
     num_pages_per_seq = block_table.shape[1]
 
     # Upper bound on kv length: caller-provided hint, else from the block table shape
@@ -1139,46 +1266,57 @@ def paged_attn_triton_decode(
         max_k_len = min(max_k_len, max_kv_len + kv_append_len)
 
     programs = bsz * n_kv_heads * h_blocks
-    if num_splits is None:
-        dev = q.device.index
-        if dev not in _decode_sm_count:
-            _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-        target = 2 * _decode_sm_count[dev]
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
-    split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
+    dev = q.device.index
+    if dev not in _decode_sm_count:
+        _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+    target = 2 * _decode_sm_count[dev]
 
-    if num_splits > 1:
-        partial_o = torch.empty(programs * num_splits * block_rows * head_dim, dtype = torch.float32, device = q.device)
-        partial_ml = torch.empty(programs * num_splits * block_rows * 2, dtype = torch.float32, device = q.device)
-    else:
-        partial_o = q   # unused
-        partial_ml = q  # unused
-
-    with torch.cuda.device(q.device):
-        if k is not None and kv_append_len:
-            update_block_d = triton.next_power_of_2(head_dim)
-            _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
-                k, v, k_cache, v_cache, block_table, cache_seqlens,
-                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
-                num_warps=2, num_stages=3,
-            )
-
-        _paged_attn_decode_split_kernel[(programs, num_splits)](
+    def prepare(block_n):
+        """Split count, partial buffers and the split kernel's argument list for one kv tile."""
+        splits = num_splits
+        if splits is None:
+            splits = max(1, min(target // programs, triton.cdiv(max_k_len, 1 * block_n), 128))
+        split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
+        if splits > 1:
+            partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * splits * block_rows * 2, dtype = torch.float32, device = q.device)
+        else:
+            partial_o = q   # unused
+            partial_ml = q  # unused
+        args = (
             q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
-            split_len, num_pages_per_seq, num_splits, sinks,
+            split_len, num_pages_per_seq, splits, sinks,
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
-            page_size, head_dim, float(softmax_scale),
+            page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            num_splits == 1, has_sinks, block_m, block_h, block_rows, block_n,
-            num_warps=num_warps, num_stages=num_stages,
+            splits == 1, has_sinks, block_rows, block_n,
+        )
+        return args, splits, partial_o, partial_ml
+
+    with torch.cuda.device(q.device):
+        pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_rows, h_blocks, bool(causal), window_left >= 0,
+                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
+        block_n = pick_config(
+            q.device, "paged_attn_decode", pick_key, candidates,
+            lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
+                                    num_warps = num_warps, num_stages = num_stages))
+        args, num_splits, partial_o, partial_ml = prepare(block_n)
+
+        if k is not None and kv_append_len:
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                             n_kv_heads, page_size, head_dim)
+
+        _paged_attn_decode_split_kernel[(programs, num_splits)](
+            *args, num_warps = num_warps, num_stages = num_stages,
         )
 
         if num_splits > 1:
-            _paged_attn_decode_combine_kernel[(programs,)](
+            rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
+            _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
-                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim,
-                block_m, block_h, block_rows,
+                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
+                block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )
     return out
@@ -1186,12 +1324,10 @@ def paged_attn_triton_decode(
 
 def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len > 16 or
         args.dim > 512 or
-        not _is_power_of_2(args.dim) or
         args.q.dtype != torch.float16 or
         args.k_cache.dtype != torch.float16
     ):
@@ -1228,6 +1364,7 @@ def _paged_attn_prefill_inner(
     n_kv_heads: tl.constexpr,
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
+    HD_PAD: tl.constexpr,
     QCK: tl.constexpr,
     QCV: tl.constexpr,
     CAUSAL: tl.constexpr,
@@ -1243,8 +1380,10 @@ def _paged_attn_prefill_inner(
     """One pass over kv tiles [n_start, n_end). With MASKED = False the tiles are known to be
     fully inside the causal/window region for every row and all bounds/mask logic is skipped.
     With SRC_NEW the k_cache/v_cache arguments are contiguous (rows, kv_heads, head_dim) base
-    pointers pre-offset so the absolute kv index addresses them directly (block table unused)."""
-    offs_d = tl.arange(0, head_dim)
+    pointers pre-offset so the absolute kv index addresses them directly (block table unused).
+    HD_PAD > head_dim zero-pads the head width (masked loads, fp16 sources only need it)."""
+    offs_d = tl.arange(0, HD_PAD)
+    d_mask = offs_d < head_dim
     for n0 in range(n_start, n_end, BLOCK_N):
         offs_n = n0 + offs_n_base
         page = offs_n // page_size
@@ -1258,19 +1397,29 @@ def _paged_attn_prefill_inner(
 
         if SRC_NEW:
             k_ptrs = k_cache + ((offs_n[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
-            if MASKED:
+            if HD_PAD > head_dim:
+                if MASKED:
+                    k_tile = tl.load(k_ptrs, mask = (offs_n[None, :] < n_end) & d_mask[:, None], other = 0.0)
+                else:
+                    k_tile = tl.load(k_ptrs, mask = d_mask[:, None], other = 0.0)
+            elif MASKED:
                 k_tile = tl.load(k_ptrs, mask = offs_n[None, :] < n_end, other = 0.0)
             else:
                 k_tile = tl.load(k_ptrs)
         elif QCK > 0:
             tok_rows = phys * page_size + page_off
             if MASKED:
-                k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim)
+                k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n < n_end, QCK, n_kv_heads, head_dim, HD_PAD)
             else:
-                k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n >= 0, QCK, n_kv_heads, head_dim)
+                k_tile = _qc_load_kt(k_cache, k_scales, tok_rows, kv_head, offs_d, offs_n >= 0, QCK, n_kv_heads, head_dim, HD_PAD)
         else:
             k_ptrs = k_cache + (((phys[None, :] * page_size + page_off[None, :]) * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
-            if MASKED:
+            if HD_PAD > head_dim:
+                if MASKED:
+                    k_tile = tl.load(k_ptrs, mask = (offs_n[None, :] < n_end) & d_mask[:, None], other = 0.0)
+                else:
+                    k_tile = tl.load(k_ptrs, mask = d_mask[:, None], other = 0.0)
+            elif MASKED:
                 k_tile = tl.load(k_ptrs, mask = offs_n[None, :] < n_end, other = 0.0)
             else:
                 k_tile = tl.load(k_ptrs)
@@ -1308,19 +1457,29 @@ def _paged_attn_prefill_inner(
 
         if SRC_NEW:
             v_ptrs = v_cache + ((offs_n[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            if MASKED:
+            if HD_PAD > head_dim:
+                if MASKED:
+                    v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & d_mask[None, :], other = 0.0)
+                else:
+                    v_tile = tl.load(v_ptrs, mask = d_mask[None, :], other = 0.0)
+            elif MASKED:
                 v_tile = tl.load(v_ptrs, mask = offs_n[:, None] < n_end, other = 0.0)
             else:
                 v_tile = tl.load(v_ptrs)
         elif QCV > 0:
             tok_rows_v = phys * page_size + page_off
             if MASKED:
-                v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim)
+                v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n < n_end, QCV, n_kv_heads, head_dim, HD_PAD)
             else:
-                v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n >= 0, QCV, n_kv_heads, head_dim)
+                v_tile = _qc_load_v(v_cache, v_scales, tok_rows_v, kv_head, offs_d, offs_n >= 0, QCV, n_kv_heads, head_dim, HD_PAD)
         else:
             v_ptrs = v_cache + (((phys[:, None] * page_size + page_off[:, None]) * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
-            if MASKED:
+            if HD_PAD > head_dim:
+                if MASKED:
+                    v_tile = tl.load(v_ptrs, mask = (offs_n[:, None] < n_end) & d_mask[None, :], other = 0.0)
+                else:
+                    v_tile = tl.load(v_ptrs, mask = d_mask[None, :], other = 0.0)
+            elif MASKED:
                 v_tile = tl.load(v_ptrs, mask = offs_n[:, None] < n_end, other = 0.0)
             else:
                 v_tile = tl.load(v_ptrs)
@@ -1358,6 +1517,7 @@ def _paged_attn_prefill_kernel(
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     page_size: tl.constexpr,
     head_dim: tl.constexpr,
+    HD_PAD: tl.constexpr,      # power of two >= head_dim: tile width, zero-padded columns
     scale: tl.constexpr,
     CAUSAL: tl.constexpr,
     WINDOW_LEFT,         # runtime: span-dependent for non-causal (VLM) spans
@@ -1366,6 +1526,7 @@ def _paged_attn_prefill_kernel(
     HAS_WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    WIDE_INDEX: tl.constexpr,  # int64 q/out/partial index math (element offsets past 2^31)
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -1381,13 +1542,21 @@ def _paged_attn_prefill_kernel(
     kv_head = q_head // group_size
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, head_dim)
+    offs_d = tl.arange(0, HD_PAD)
+    d_mask = offs_d < head_dim
     valid_row = offs_m < q_len
 
-    q_ptrs = q + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
-    q_tile = tl.load(q_ptrs, mask = valid_row[:, None], other = 0.0)
+    # q/out element offsets reach q_len * n_q_heads * head_dim, past int32 at ~64k rows for
+    # 32-head/256-dim geometry: widen the row term. Conditional on the wrapper detecting a
+    # tensor past the boundary, so common geometries keep pure int32 index math
+    if WIDE_INDEX:
+        row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    else:
+        row64 = batch * q_len + offs_m[:, None]
+    q_ptrs = q + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
+    q_tile = tl.load(q_ptrs, mask = valid_row[:, None] & d_mask[None, :], other = 0.0)
     if QCK > 0:
-        q_tile = _rot_h32(q_tile, h32, BLOCK_M, head_dim)
+        q_tile = _rot_h32(q_tile, h32, BLOCK_M, HD_PAD)
 
     total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
     q_abs = total_k_len - q_len + offs_m
@@ -1395,7 +1564,7 @@ def _paged_attn_prefill_kernel(
 
     m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_M,), 0.0, tl.float32)
-    acc = tl.zeros((BLOCK_M, head_dim), tl.float32)
+    acc = tl.zeros((BLOCK_M, HD_PAD), tl.float32)
     offs_n_base = tl.arange(0, BLOCK_N)
     block_table_b = block_table + batch * num_pages_per_seq
 
@@ -1438,13 +1607,13 @@ def _paged_attn_prefill_kernel(
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(s_hi, past), q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, False, BLOCK_N,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(s_lo, past), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, True, BLOCK_N,
         )
     elif NEW_KV == 2:
@@ -1454,20 +1623,20 @@ def _paged_attn_prefill_kernel(
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
-                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+                n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 False, True, BLOCK_N,
             )
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+                n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 True, True, BLOCK_N,
             )
         else:
             acc, m, l = _paged_attn_prefill_inner(
                 q_tile, acc, m, l, k_new_b, v_new_b, block_table_b, k_scales, v_scales, kv_head,
                 offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-                n_kv_heads, page_size, head_dim, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+                n_kv_heads, page_size, head_dim, HD_PAD, 0, 0, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
                 True, True, BLOCK_N,
             )
     elif CAUSAL and not HAS_WINDOW_LEFT and not HAS_WINDOW_RIGHT:
@@ -1475,27 +1644,31 @@ def _paged_attn_prefill_kernel(
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, tl.minimum(n_full, s_hi), q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             False, False, BLOCK_N,
         )
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, tl.maximum(n_full, s_lo), s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, False, BLOCK_N,
         )
     else:
         acc, m, l = _paged_attn_prefill_inner(
             q_tile, acc, m, l, k_cache, v_cache, block_table_b, k_scales, v_scales, kv_head,
             offs_n_base, s_lo, s_hi, q_abs, valid_row, qk_scale_log2e, total_k_len,
-            n_kv_heads, page_size, head_dim, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
+            n_kv_heads, page_size, head_dim, HD_PAD, QCK, QCV, CAUSAL, WINDOW_LEFT, WINDOW_RIGHT, HAS_WINDOW_LEFT, HAS_WINDOW_RIGHT, SOFTCAP,
             True, False, BLOCK_N,
         )
 
     if IS_SPLIT:
-        pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
-        po_base = pid_lin * BLOCK_M * head_dim
-        tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * head_dim + offs_d[None, :], acc)
+        # partial_o offsets reach programs * num_splits * BLOCK_M * head_dim: widen
+        if WIDE_INDEX:
+            pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits + split).to(tl.int64)
+        else:
+            pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits + split
+        po_base = pid_lin * BLOCK_M * HD_PAD
+        tl.store(partial_o + po_base + tl.arange(0, BLOCK_M)[:, None] * HD_PAD + offs_d[None, :], acc)
         ml_base = pid_lin * BLOCK_M * 2
         tl.store(partial_ml + ml_base + tl.arange(0, BLOCK_M) * 2, m)
         tl.store(partial_ml + ml_base + tl.arange(0, BLOCK_M) * 2 + 1, l)
@@ -1509,9 +1682,9 @@ def _paged_attn_prefill_kernel(
             l = l * alpha_s + tl.exp2(sink - m_top)
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
         if QCV > 0:
-            out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
-        out_ptrs = out + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
-        tl.store(out_ptrs, out_tile, mask = valid_row[:, None])
+            out_tile = _rot_h32(out_tile, h32, BLOCK_M, HD_PAD)
+        out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
+        tl.store(out_ptrs, out_tile, mask = valid_row[:, None] & d_mask[None, :])
 
 
 @triton.jit
@@ -1527,6 +1700,8 @@ def _paged_attn_prefill_combine_kernel(
     q_len,               # runtime: only masks and address math
     n_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    HD_PAD: tl.constexpr,
+    WIDE_INDEX: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -1535,9 +1710,14 @@ def _paged_attn_prefill_combine_kernel(
     q_head = bh - batch * n_q_heads
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, head_dim)
+    offs_d = tl.arange(0, HD_PAD)
+    d_mask = offs_d < head_dim
     rows = tl.arange(0, BLOCK_M)
-    pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits
+    # same int32 overflow considerations as the prefill kernel: partial and out offsets widen
+    if WIDE_INDEX:
+        pid_lin = ((pid_m * tl.num_programs(1) + bh) * num_splits).to(tl.int64)
+    else:
+        pid_lin = (pid_m * tl.num_programs(1) + bh) * num_splits
 
     m_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     for sp in range(num_splits):
@@ -1550,13 +1730,13 @@ def _paged_attn_prefill_combine_kernel(
     m_safe = tl.where(m_max == -float("inf"), 0.0, m_max)
 
     l_sum = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, head_dim), tl.float32)
+    acc = tl.zeros((BLOCK_M, HD_PAD), tl.float32)
     for sp in range(num_splits):
         ml_base = (pid_lin + sp) * BLOCK_M * 2
         m_s = tl.load(partial_ml + ml_base + rows * 2)
         l_s = tl.load(partial_ml + ml_base + rows * 2 + 1)
         w = tl.where(m_s == -float("inf"), 0.0, tl.exp2(m_s - m_safe))
-        o_s = tl.load(partial_o + (pid_lin + sp) * BLOCK_M * head_dim + rows[:, None] * head_dim + offs_d[None, :])
+        o_s = tl.load(partial_o + (pid_lin + sp) * BLOCK_M * HD_PAD + rows[:, None] * HD_PAD + offs_d[None, :])
         acc += o_s * w[:, None]
         l_sum += l_s * w
 
@@ -1564,9 +1744,13 @@ def _paged_attn_prefill_combine_kernel(
         l_sum += tl.exp2(sink - m_safe)
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
     if QCV > 0:
-        out_tile = _rot_h32(out_tile, h32, BLOCK_M, head_dim)
-    out_ptrs = out + (((batch * q_len + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :])
-    tl.store(out_ptrs, out_tile, mask = (offs_m[:, None] < q_len))
+        out_tile = _rot_h32(out_tile, h32, BLOCK_M, HD_PAD)
+    if WIDE_INDEX:
+        row64 = (batch * q_len + offs_m[:, None]).to(tl.int64)
+    else:
+        row64 = batch * q_len + offs_m[:, None]
+    out_ptrs = out + ((row64 * n_q_heads + q_head) * head_dim + offs_d[None, :])
+    tl.store(out_ptrs, out_tile, mask = (offs_m[:, None] < q_len) & d_mask[None, :])
 
 
 # Pipeline-stage pick for the quantized-cache prefill kernel: the in-loop dequant leaves the
@@ -1619,6 +1803,7 @@ def paged_attn_triton_prefill(
     num_stages: int | None = None,
     num_splits: int | None = None,
     max_kv_len: int | None = None,
+    staging_pages: int | None = None,
     qc: tuple | None = None,
     pre_appended_len: int = 0,
     n_kv_heads_override: int | None = None,
@@ -1632,9 +1817,6 @@ def paged_attn_triton_prefill(
     touching the cache -- kv positions at or above cache_seqlens[b] read from them. The direct
     form also works without a cache at all (k_cache = None), covering plain non-cached
     attention."""
-    if not has_triton:
-        raise RuntimeError("paged_attn_triton_prefill requires Triton, but Triton is not available")
-
     _check_tensor("q", q)
 
     bsz, q_len, n_q_heads, head_dim = q.shape
@@ -1672,8 +1854,11 @@ def paged_attn_triton_prefill(
     _check_tensor("cache_seqlens", cache_seqlens, None)
     if n_q_heads % n_kv_heads != 0:
         raise ValueError("n_q_heads must be divisible by n_kv_heads")
-    if head_dim > 512 or not _is_power_of_2(head_dim):
-        raise ValueError("paged_attn_triton_prefill currently supports power-of-two head_dim <= 512")
+    if head_dim > 512:
+        raise ValueError("paged_attn_triton_prefill supports head_dim <= 512")
+    if qc is not None and head_dim % 32 != 0:
+        raise ValueError("quantized caches need head_dim to be a multiple of 32")
+    hd_pad = triton.next_power_of_2(head_dim)   # tile width; non-power-of-two dims are zero-padded
 
     kv_append_len = pre_appended_len
     if k is not None or v is not None:
@@ -1702,87 +1887,193 @@ def paged_attn_triton_prefill(
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
         h32 = _get_h32(q.device)
+
+        # Two-pass quantized-cache prefill: dequantize the referenced window once into a compact
+        # fp16 scratch and run the fp16 kernel over it. In-kernel dequant re-expands every kv
+        # tile once per (q block x sibling q head) -- measured 6-26% slower than fp16 depending
+        # on bitrate, unrecoverable by tile/stage tuning -- while the one-shot dequant pass costs
+        # ~2% of the kernel and the fp16 kernel runs at full speed. Compute-bound chunks only;
+        # short query batches stay on the direct path, which reads less gmem
+        # (causal only: VLM span chunks fan out into several wrapper calls over the same window,
+        # which would repeat the dequant pass per span -- those keep the direct path.) The
+        # scratch is a per-call transient of one fixed size per layer: the caller's staging_pages
+        # (the pool, or the bounded window QSA's dense regime can reach), else the pool itself.
+        # The window actually dequantized is the block-table span (a job's pages, not the pool),
+        # narrowed further when the caller bounds the past length, but the allocation never
+        # tracks it: a scratch that grew with the context would hand the allocator a new size
+        # every few chunks of a long prefill, and without expandable segments every size seen
+        # stays cached. A batched table pads every row to the batch's max page count and can
+        # exceed the pool; that rare case is sized exactly. Workspaces are not kept as statics:
+        # the old pool-sized static held a full fp16 copy of the cache for the life of the
+        # process. The loader's autosplit budgets the same fixed size through
+        # Attention.autosplit_extra_measure
+        if (_qc_staging == 1 and q_len >= qc_prefill_two_pass_min_q(q.device)
+                and new_kv_mode == 0 and k is None and causal):
+            from ...ext import exllamav3_ext as ext
+            npps_w = block_table.shape[1]
+            if max_kv_len is not None:
+                npps_w = min(npps_w, -(-(max_kv_len + kv_append_len) // page_size))
+                block_table = block_table[:, :npps_w].contiguous()
+            n_kvh = n_kv_heads_override
+            pages = bsz * npps_w
+            pages_alloc = max(pages, staging_pages if staging_pages is not None else k_cache.shape[0])
+            kd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
+            vd = torch.empty((pages_alloc, page_size, n_kvh, head_dim), dtype = torch.half, device = q.device)
+            ext.dequant_cache_paged_window(
+                k_cache, k_scales, kd, v_cache, v_scales, vd,
+                cache_seqlens, block_table, page_size, kv_append_len, 0.0,
+            )
+            k_cache, v_cache = kd, vd
+            block_table = torch.arange(bsz * npps_w, dtype = torch.int32, device = q.device).view(bsz, npps_w)
+            qc = None
+            k_scales, v_scales, qck, qcv = q, q, 0, 0
+            h32 = q
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
 
-    # Tile configs by head_dim, sized for ~100 KB of smem with two pipeline stages. Blackwell
-    # prefers narrower kv tiles (measured: 167 vs 153 TFLOPS on RTX 5090 at BN 32 vs 64)
-    blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
-    if head_dim <= 128:
-        cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
-    elif head_dim <= 256:
-        cfg = (64, 32, 8, 2)
+    # sm_75: a prefill chunk over a dense fp16 cache (the staged window above, or the fp16 cache itself)
+    # attends through SDPA / fa75 instead of the Triton kernel (util/backend.py). The direct quantized
+    # kernel is kept for what the staging pass left out (short chunks below its threshold, non-causal)
+    if (
+        qc is None and k_cache is not None and new_kv_mode == 0 and causal and q_len > 8 and
+        window_left < 0 and window_right < 0 and not softcap and not has_sinks and
+        q.dtype == torch.float16 and _sdpa_prefill(q.device)
+    ):
+        from .torch import sdpa_prefill_paged
+        if k is not None and kv_append_len:
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, block_table.shape[1], bsz,
+                             kv_append_len, n_kv_heads, page_size, head_dim)
+        return sdpa_prefill_paged(q, k_cache, v_cache, block_table, cache_seqlens, kv_append_len, causal,
+                                  softmax_scale, out)
+
+    # Tile configs by head_dim, sized for ~100 KB of smem. Four warps over a 64-row tile keep
+    # each warp on whole 16-row MMA tiles; eight warps split the rows below that granularity
+    # and stall the dots (issue #384). Blackwell prefers narrower kv tiles and a third stage
+    # (HIP reports the gfx generation as the major version, so the threshold only applies to CUDA)
+    blackwell = not ROCM and torch.cuda.get_device_capability(q.device)[0] >= 10
+    if hd_pad <= 128:
+        cfg = (128, 32, 4, 3) if blackwell else (128, 32, 4, 2)
+    elif hd_pad <= 256:
+        cfg = (64, 32, 4, 2)
     else:
         cfg = (32, 16, 4, 2)
-    num_stages_forced = num_stages is not None
-    block_m = block_m or cfg[0]
-    block_n = block_n or cfg[1]
-    num_warps = num_warps or cfg[2]
-    num_stages = num_stages or cfg[3]
-    if qc is not None:
+    # RDNA (wave32): eight warps over a 128-row q tile, so each wave still owns whole 16-row WMMA tiles;
+    # at head_dim 256 (fp16 cache) a single stage keeps the tile inside the 64 KB LDS.
+    if ROCM:
+        if hd_pad <= 128:
+            cfg = (128, 32, 8, 2)
+        elif hd_pad <= 256 and qc is None:
+            if q.shape[1] >= 128:
+                cfg = (128, 32, 8, 2 if gfx_arch(q.device) == "gfx1100" else 1)
+            else:
+                cfg = (64, 32, 8, 1)
+    # Pre-Ampere (Turing/Volta, 64 KB per-block smem; the C++ EXL3_SM75 gate is
+    # __CUDA_ARCH__ < 800, the same class): the stock tiles overcommit the device's budget,
+    # and the ladder's first fit starves the mma pipeline -- at hd_pad 256 it is
+    # (32, 32, 2, 2), which fits exactly but runs at 2 warps per block. Measured on a 2080 Ti
+    # (hd 256, GQA 16/4, q_len 1792): (16, 32, 8, 2) is ~6x faster (17.6 vs 118.3 ms): the
+    # narrower q tile doubles the program count and the 8 warps keep the dots fed, the kv tile
+    # stays intact. The other hd_pad ranges halve the q tile only (unmeasured: no pre-Ampere
+    # model at those dims).
+    if torch.cuda.get_device_capability(q.device)[0] < 8:
+        cfg = (16, 32, 8, 2) if hd_pad == 256 else (max(16, cfg[0] // 2), cfg[1], cfg[2], cfg[3])
+    forced = (block_m, block_n, num_warps, num_stages)
+    if qc is not None and block_n is None:
         # compact plane tiles stage fewer smem bytes than fp16: wider kv tiles pay off. Wide
         # bit widths at large head_dim overstep the ~99 KB smem budget with the non-causal loop
         # structure (measured boundary: head_dim >= 256 with k_bits + v_bits >= 13), so halve
         # the kv tile there. num_stages is picked per family below
-        block_n = max(16, min(128, 16384 // head_dim))
-        if head_dim >= 256 and qck + qcv >= 13 and block_n > 16:
-            block_n //= 2
+        bn = max(16, min(128, 16384 // hd_pad))
+        if hd_pad >= 256 and qck + qcv >= 13 and bn > 16:
+            bn //= 2
+        cfg = (cfg[0], bn, cfg[2], cfg[3])
+    stock = tuple(f if f is not None else c for f, c in zip(forced, cfg))
+    # Caller-forced values pin the config; otherwise the ladder is walked against the device's
+    # shared memory budget (smem.py), which only steps below the stock tiles on small devices
+    candidates = [stock] if any(f is not None for f in forced) else tile_ladder(*stock)
+    num_stages_forced = forced[3] is not None
 
     num_pages_per_seq = block_table.shape[1]
-    q_blocks = triton.cdiv(q_len, block_m)
-    programs = q_blocks * bsz * n_q_heads
+    dev = q.device.index
+    if dev not in _decode_sm_count:
+        _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sms = _decode_sm_count[dev]
 
-    # Split the kv range when the grid would quantize badly against the SM count (uniform
-    # full-length programs at 1 block/SM leave a mostly idle trailing wave). Pick the split
-    # count minimizing ceil-waves per unit of work, with a small penalty per extra split
-    if num_splits is None:
-        bound_kv = num_pages_per_seq * page_size + kv_append_len
-        if max_kv_len is not None:
-            bound_kv = min(bound_kv, max_kv_len + kv_append_len)
-        dev = q.device.index
-        if dev not in _decode_sm_count:
-            _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
-        sms = _decode_sm_count[dev]
-        num_splits = 1
-        if bound_kv >= 8192:
-            best = None
-            for cand in (1, 2, 3, 4, 5, 6, 8):
-                cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
-                if best is None or cost < best[0]:
-                    best = (cost, cand)
-            num_splits = best[1]
+    def prepare(cfg):
+        """Launch geometry for one tile config: grid, kv split count, partial buffers and the
+        kernel argument list (the probe compiles with exactly the launch's arguments)."""
+        block_m, block_n, num_warps, num_stages = cfg
+        q_blocks = triton.cdiv(q_len, block_m)
+        programs = q_blocks * bsz * n_q_heads
 
-    if num_splits > 1:
-        partial_o = torch.empty(programs * num_splits * block_m * head_dim, dtype = torch.float32, device = q.device)
-        partial_ml = torch.empty(programs * num_splits * block_m * 2, dtype = torch.float32, device = q.device)
-    else:
-        partial_o = q   # unused
-        partial_ml = q  # unused
+        # Split the kv range when the grid would quantize badly against the SM count (uniform
+        # full-length programs at 1 block/SM leave a mostly idle trailing wave). Pick the split
+        # count minimizing ceil-waves per unit of work, with a small penalty per extra split
+        splits = num_splits
+        if splits is None:
+            bound_kv = num_pages_per_seq * page_size + kv_append_len
+            if max_kv_len is not None:
+                bound_kv = min(bound_kv, max_kv_len + kv_append_len)
+            splits = 1
+            if bound_kv >= 8192 and programs:
+                best = None
+                for cand in (1, 2, 3, 4, 5, 6, 8):
+                    cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
+                    if best is None or cost < best[0]:
+                        best = (cost, cand)
+                splits = best[1]
+                # Splitting fixes grid quantization when programs are few; at large program counts
+                # the ceil-noise in the cost model can still pick a high split count whose fp32
+                # partial buffer is enormous (64k q_len x 32 heads: ~2 GB per split). The gain there
+                # is negligible by construction, so bound the buffer rather than trust the penalty
+                max_partial_bytes = 128 * 1024 * 1024
+                max_splits = max(1, max_partial_bytes // (programs * block_m * hd_pad * 4))
+                splits = min(splits, max_splits)
+
+        if splits > 1:
+            partial_o = torch.empty(programs * splits * block_m * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * splits * block_m * 2, dtype = torch.float32, device = q.device)
+        else:
+            partial_o = q   # unused
+            partial_ml = q  # unused
+
+        grid = (q_blocks, bsz * n_q_heads, splits)
+        # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
+        # fp32 partial buffer); common geometries keep pure int32 codegen
+        wide_index = max(
+            bsz * q_len * n_q_heads * head_dim,
+            q_blocks * bsz * n_q_heads * splits * block_m * hd_pad,
+        ) >= 1 << 31
+        args = (
+            q, k_cache, v_cache, block_table, cache_seqlens, out,
+            partial_o, partial_ml, k_scales, v_scales, h32,
+            k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
+            splits, splits > 1, new_kv_mode, qck, qcv,
+            q_len, kv_append_len, n_q_heads, n_kv_heads,
+            num_pages_per_seq, page_size, head_dim, hd_pad, float(softmax_scale),
+            bool(causal), int(window_left), int(window_right),
+            window_left >= 0, window_right >= 0, float(softcap or 0.0),
+            has_sinks, wide_index, block_m, block_n,
+        )
+        return grid, args, num_warps, num_stages, q_blocks, splits, partial_o, partial_ml, block_m, wide_index
 
     with torch.cuda.device(q.device):
-        if k is not None and kv_append_len:
-            update_block_d = triton.next_power_of_2(head_dim)
-            _paged_kv_update_kernel[(bsz * kv_append_len, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
-                k, v, k_cache, v_cache, block_table, cache_seqlens,
-                num_pages_per_seq, kv_append_len, n_kv_heads, page_size, head_dim, update_block_d,
-                num_warps=2, num_stages=3,
-            )
+        pick_key = (head_dim, hd_pad, qck, qcv, new_kv_mode, bool(causal), window_left >= 0,
+                    window_right >= 0, has_sinks, stock)
+        def probe(cfg):
+            _, args, nw, ns, *_ = prepare(cfg)
+            return shared_bytes(_paged_attn_prefill_kernel, args, num_warps = nw, num_stages = ns)
+        cfg = pick_config(q.device, "paged_attn_prefill", pick_key, candidates, probe)
+        grid, args, num_warps, num_stages, q_blocks, num_splits, partial_o, partial_ml, block_m, wide_index = prepare(cfg)
+        block_n = cfg[1]
 
-        grid = (q_blocks, bsz * n_q_heads, num_splits)
+        if k is not None and kv_append_len:
+            _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                             n_kv_heads, page_size, head_dim)
+
         def launch(ns):
-            _paged_attn_prefill_kernel[grid](
-                q, k_cache, v_cache, block_table, cache_seqlens, out,
-                partial_o, partial_ml, k_scales, v_scales, h32,
-                k_new if new_kv_mode else q, v_new if new_kv_mode else q, sinks,
-                num_splits, num_splits > 1, new_kv_mode, qck, qcv,
-                q_len, kv_append_len, n_q_heads, n_kv_heads,
-                num_pages_per_seq, page_size, head_dim, float(softmax_scale),
-                bool(causal), int(window_left), int(window_right),
-                window_left >= 0, window_right >= 0, float(softcap or 0.0),
-                has_sinks, block_m, block_n,
-                num_warps=num_warps, num_stages=ns,
-            )
+            _paged_attn_prefill_kernel[grid](*args, num_warps = num_warps, num_stages = ns)
 
         if qc is not None and not num_stages_forced:
             if _qc_prefill_ns_env:
@@ -1802,7 +2093,7 @@ def paged_attn_triton_prefill(
         if num_splits > 1:
             _paged_attn_prefill_combine_kernel[(q_blocks, bsz * n_q_heads)](
                 partial_o, partial_ml, out, h32, sinks,
-                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, block_m,
+                num_splits, qcv, has_sinks, q_len, n_q_heads, head_dim, hd_pad, wide_index, block_m,
                 num_warps=8, num_stages=1,
             )
     return out
@@ -1811,11 +2102,9 @@ def paged_attn_triton_prefill(
 def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
     """Non-cached attention through the prefill kernel's direct-kv source (NEW_KV=2)."""
     if (
-        not has_triton or
         args.is_varlen() or
         args.has_kv_cache() or
         args.dim > 512 or
-        not _is_power_of_2(args.dim) or
         args.q.dtype != torch.float16 or
         args.non_causal_spans or
         not args.q.is_contiguous() or
@@ -1838,12 +2127,10 @@ def fn_triton_attn_nocache(args: AttnArgs) -> torch.Tensor | None:
 
 def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         args.is_varlen() or
         not args.has_kv_cache() or
         args.q_len <= 16 or
         args.dim > 512 or
-        not _is_power_of_2(args.dim) or
         args.q.dtype != torch.float16 or
         args.k_cache.dtype != torch.float16
     ):
@@ -1866,6 +2153,7 @@ def fn_triton_paged_attn_prefill(args: AttnArgs) -> torch.Tensor | None:
         window_size=args.get_window_size(),
         softcap=args.softcap,
         sinks=args.sinks,
+        max_kv_len=args.max_kv_len,
     )
 
 
@@ -1887,12 +2175,18 @@ def _varlen_attn_kernel(
     WINDOW_RIGHT: tl.constexpr,
     SOFTCAP: tl.constexpr,
     HAS_SINKS: tl.constexpr,
+    SINK_KEY0: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """Packed varlen self-attention (no cache): each segment of the packed sequence attends
     within itself. Grid: (q blocks of the longest segment, segments, q heads); programs beyond
-    a segment's length exit early. head_dim need not be a power of two (padded loads)."""
+    a segment's length exit early. head_dim need not be a power of two (padded loads).
+
+    Sinks come in two forms: HAS_SINKS is the gpt-oss extra logit that joins the softmax
+    denominator without a value; SINK_KEY0 adds the per-head sink to the logit of each
+    segment's first key instead (MiMo-ViT), so the mass lands on that key's value and the
+    window still decides whether the key is visible at all."""
     pid_m = tl.program_id(0)
     seg = tl.program_id(1)
     q_head = tl.program_id(2)
@@ -1913,6 +2207,8 @@ def _varlen_attn_kernel(
     q_ptrs = q + ((q0 + offs_m[:, None]) * n_q_heads + q_head) * head_dim + offs_d[None, :]
     q_tile = tl.load(q_ptrs, mask = valid_row[:, None] & d_mask[None, :], other = 0.0)
     qk_scale_log2e = scale * 1.4426950408889634
+    if SINK_KEY0:
+        sink_l2 = tl.load(sinks + q_head).to(tl.float32) * 1.4426950408889634
 
     m = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     l = tl.full((BLOCK_M,), 0.0, tl.float32)
@@ -1947,6 +2243,8 @@ def _varlen_attn_kernel(
             scores = s_nat * 1.4426950408889634
         else:
             scores = scores * qk_scale_log2e
+        if SINK_KEY0:
+            scores = tl.where(offs_n[None, :] == 0, scores + sink_l2, scores)
 
         m_new = tl.maximum(m, tl.max(scores, axis = 1))
         p = tl.exp2(scores - m_new[:, None])
@@ -1969,6 +2267,8 @@ def _varlen_attn_kernel(
             scores = s_nat * 1.4426950408889634
         else:
             scores = scores * qk_scale_log2e
+        if SINK_KEY0:
+            scores = tl.where(offs_n[None, :] == 0, scores + sink_l2, scores)
 
         valid = valid_row[:, None] & (offs_n[None, :] < n_hi)
         if CAUSAL:
@@ -2014,13 +2314,11 @@ def varlen_attn_triton(
     window_size: int | tuple[int, int] | None = None,
     softcap: float = 0.0,
     sinks: torch.Tensor | None = None,
+    sink_key0: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed varlen self-attention over (total, heads, head_dim) tensors, segments given by
     cu_seqlens (as flash_attn_varlen_func with cu_seqlens_q == cu_seqlens_k)."""
-    if not has_triton:
-        raise RuntimeError("varlen_attn_triton requires Triton, but Triton is not available")
-
     squeeze = q.ndim == 4
     if squeeze:
         q, k, v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
@@ -2048,13 +2346,25 @@ def varlen_attn_triton(
         if num_warps > 4:
             num_warps //= 2
 
-    with torch.cuda.device(q.device):
-        grid = (triton.cdiv(max_seqlen, block_m), num_segs, n_q_heads)
-        _varlen_attn_kernel[grid](
+    def args_for(cfg):
+        block_m, block_n, num_warps, num_stages = cfg
+        return (
             q, k, v, cu_seqlens, out, sinks,
             n_q_heads, n_kv_heads, head_dim, hd_p2, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            has_sinks, block_m, block_n,
+            has_sinks and not sink_key0, has_sinks and sink_key0, block_m, block_n,
+        )
+
+    with torch.cuda.device(q.device):
+        stock = (block_m, block_n, num_warps, num_stages)
+        pick_key = (head_dim, hd_p2, bool(causal), window_left >= 0, window_right >= 0,
+                    has_sinks, sink_key0, stock)
+        block_m, block_n, num_warps, num_stages = pick_config(
+            q.device, "varlen_attn", pick_key, tile_ladder(*stock),
+            lambda cfg: shared_bytes(_varlen_attn_kernel, args_for(cfg), num_warps = cfg[2], num_stages = cfg[3]))
+        grid = (triton.cdiv(max_seqlen, block_m), num_segs, n_q_heads)
+        _varlen_attn_kernel[grid](
+            *args_for((block_m, block_n, num_warps, num_stages)),
             num_warps=num_warps, num_stages=num_stages,
         )
     return out.unsqueeze(0) if squeeze else out
@@ -2062,7 +2372,6 @@ def varlen_attn_triton(
 
 def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
     if (
-        not has_triton or
         not args.is_varlen() or
         args.bsz > 1 or
         args.has_kv_cache() or
@@ -2083,16 +2392,16 @@ def fn_triton_varlen_attn(args: AttnArgs) -> torch.Tensor | None:
         window_size=args.get_window_size(),
         softcap=args.softcap,
         sinks=args.sinks,
+        sink_key0=args.sink_key0,
     )
 
 
 def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
-        not has_triton or
         args.q_len > 16 or
         args.dim > 512 or
-        not _is_power_of_2(args.dim) or
+        args.dim % 32 != 0 or
         args.q.dtype != torch.float16 or
         args.non_causal_spans
     ):
@@ -2111,16 +2420,16 @@ def fn_triton_paged_attn_decode_qc(args: AttnArgs) -> torch.Tensor | None:
         qc=(sk, sv, k_bits, v_bits),
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
+        max_kv_len=args.max_kv_len,
     )
 
 
 def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
     if (
         args.q_cache is None or
-        not has_triton or
         (args.q_len <= 16 and not args.non_causal_spans) or
         args.dim > 512 or
-        not _is_power_of_2(args.dim) or
+        args.dim % 32 != 0 or
         args.q.dtype != torch.float16
     ):
         return None
@@ -2145,4 +2454,6 @@ def fn_triton_paged_attn_prefill_qc(args: AttnArgs) -> torch.Tensor | None:
         qc=(sk, sv, k_bits, v_bits),
         pre_appended_len=args.q_len,
         n_kv_heads_override=args.num_kv_heads,
+        max_kv_len=args.max_kv_len,
+        staging_pages=args.staging_pages,
     )

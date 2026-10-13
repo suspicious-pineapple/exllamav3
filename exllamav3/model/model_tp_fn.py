@@ -1,42 +1,22 @@
 import torch
 import traceback
 import os
+import signal
 import sys
 import time
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
-from .model_tp_backend import TPBackendNCCL, TPBackendNative
+from .model_tp_backend import TPBackendNCCL, TPBackendNative, TPBackendNull
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
+_stream_hash_passes = int(os.environ.get("EXL3_TP_STREAM_HASH", "0") or "0")
 
 
-def install_parent_death_signal() -> bool:
-    """
-    On Linux, ask the kernel to terminate this worker if its direct parent dies.
-    This is a best-effort safety net for cases where Python shutdown hooks do not
-    get a chance to clean up spawned TP workers.
-    """
-    if sys.platform != "linux":
-        return False
-
-    import ctypes
-    import signal
-
-    PR_SET_PDEATHSIG = 1
-    parent_pid = os.getppid()
-
-    libc = ctypes.CDLL("libc.so.6", use_errno = True)
-    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
-        return False
-
-    # Race check: the parent may have exited before PDEATHSIG was installed.
-    if os.getppid() != parent_pid:
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    return True
+from ..util.misc import install_parent_death_signal
+from ..util.pinned_arena import PinnedArena
 
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
@@ -49,6 +29,7 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
         "kv_modules": [],
         "recurrent_modules": [],
         "recurrent_cache": {},
+        "cpu_page_cache": None,
         "rank": rank,
         "world_size": world_size,
         "output_rank": output_rank,
@@ -94,6 +75,10 @@ def mp_model_worker(
     producer: dict,
     dbg_t0_: float
 ):
+    # Terminal Ctrl-C is delivered to the whole foreground process group; shutdown is
+    # orchestrated by the parent ("quit" command) or the kernel (PDEATHSIG), never by SIGINT
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     set_t0("TP", dbg_t0_)
     log_tp(device, f"Child process launched")
     if install_parent_death_signal():
@@ -182,6 +167,9 @@ def mp_model_append(local_context: dict, exported: dict):
 
     module = cls.tp_import(local_context, exported, plan[device])
     modules.append(module)
+    # Gated-residual sites hand a weighted stream copy to their successor; rewire on each append
+    from ..modules.hyperconnections import GatedResidual
+    GatedResidual.link_sites(modules)
     kv_modules += module.all_cache_modules()
     recurrent_modules += module.all_recurrent_modules()
     if module.caps.get("logits_output"):
@@ -233,11 +221,13 @@ def mp_model_forward(
     """
     Forward pass for parallel slice of a model
     """
-    backend = local_context["backend"]
+    # Warmup passes (Model.warmup) run every rank independently with collectives stubbed out
+    warmup = bool(params.get("tp_warmup"))
+    backend = TPBackendNull() if warmup else local_context["backend"]
     # The pass-start barrier aligns all rank streams before the first collective. The collectives
     # are individually ordered by their stage counters, so this is not required for correctness;
     # EXL3_TP_NO_FWD_BARRIER=1 skips it (experimental) to save one spin kernel per rank per pass
-    if not _no_fwd_barrier:
+    if not _no_fwd_barrier and not warmup:
         backend.fwd_barrier()
 
     modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]
@@ -249,7 +239,10 @@ def mp_model_forward(
         "positions",
         "position_ids",
         "recurrent_slots",
+        "recurrent_slots_scan",
+        "recurrent_slots_scan_in",
         "inv_freq",
+        "input_ids",     # hash-MoE routing (DeepSeek-V4 bootstrap layers)
     ]:
         p = params.get(tensor_param)
         if p is not None:
@@ -263,6 +256,19 @@ def mp_model_forward(
 
     x = consumer.recv(shared_input)
 
+    # Modules that stage input-dependent data on a worker thread (PLE n-gram rows) go first, as
+    # in the layer-split forward, so the gather overlaps the leading blocks
+    if x.dtype == torch.long and single_idx is None:
+        for module in modules:
+            if module.caps.get("prefetch_ids"):
+                module.prefetch(x, params)
+
+    # EXL3_TP_STREAM_HASH: print a digest of the residual stream after every module on every rank
+    # for the first forward passes, to locate where ranks stop agreeing bit for bit (debug)
+    stream_hash = _stream_hash_passes > 0 and not warmup and local_context.get("_hash_passes", 0) < _stream_hash_passes
+    if stream_hash:
+        local_context["_hash_passes"] = local_context.get("_hash_passes", 0) + 1
+
     for idx, module in enumerate(modules):
         logits_layer = module.caps.get("logits_output")
         if logits_layer and (num := params.get("last_tokens_only")):
@@ -271,6 +277,10 @@ def mp_model_forward(
             params["prefill"] = (idx == last_kv_module_idx)
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
+        if stream_hash and x is not None:
+            import hashlib
+            h = hashlib.sha1(x.detach().contiguous().cpu().numpy().tobytes()).hexdigest()[:12]
+            print(f"stream-hash dev={local_context['device']} pass={local_context['_hash_passes']} {idx:3d} {module.key:<44} {h} {tuple(x.shape)} {x.dtype}", flush = True)
         if prefill and idx == last_kv_module_idx:
             backend.end_cpu_reduce_jobs()
             del params["prefill"]
@@ -299,6 +309,7 @@ def mp_model_forward_lm_head_argmax(
     offset: int,
     gather_devices: list[int] | None,
     ldims: list[int] | None,
+    vocab_size: int = -1,
 ):
     consumer = local_context["inf_consumer"]
     device = local_context["device"]
@@ -311,8 +322,16 @@ def mp_model_forward_lm_head_argmax(
         module = local_context["logits_module"]
         x = module.prepare_for_device(x, params)
         x = module.forward(x, params)
-        v, i = x.max(dim = -1)
-        i += offset
+        # The head is padded to the tile size; a shard reaching past the vocabulary must not let a
+        # padding column (zero logit) win the local maximum
+        if vocab_size >= 0 and offset + x.shape[-1] > vocab_size:
+            x = x[..., :max(0, vocab_size - offset)]
+        if x.shape[-1] > 0:
+            v, i = x.max(dim = -1)
+            i += offset
+        else:
+            v = torch.full(x.shape[:-1], -float("inf"), dtype = x.dtype, device = x.device)
+            i = torch.zeros(x.shape[:-1], dtype = torch.long, device = x.device)
     else:
         v = torch.empty(*x.shape[:-1], dtype = x.dtype, device = x.device)
         i = torch.empty(*x.shape[:-1], dtype = torch.long, device = x.device)
@@ -401,6 +420,98 @@ def mp_rotate_cache_pages(
         ext.cache_rotate(cache, all_rotations, buffer)
 
 
+# CPU page cache in TP mode. The main process owns the page table, the slot table and the eviction policy but
+# holds no cache tensors, so it names a slot by index and every rank keeps its own shard of that slot here. A
+# slot is one whole page image of this rank's shard, across every attached cache, in ONE pinned slab with a
+# view carved per cache tensor. The slabs are slices of one registered arena rather than pinned tensors of
+# their own: torch's pinned allocator rounds each request up to a power of two, and per-tensor pinning is
+# O(layers) mappings per slot, which across a real budget overruns vm.max_map_count (~65k by default) long
+# before it runs out of memory.
+
+class RankSlotPool:
+    """
+    This rank's half (or third, or...) of the CPU page cache: one pinned arena holding a slab per slot
+    index, committed and locked when the tier is built.
+    """
+
+    def __init__(self, cache_tensors: list, max_slots: int):
+        # Segment layout of one slab, mirroring CPUPageCache
+        self.segments = []
+        offset = 0
+        for t in cache_tensors:
+            nbytes = t[0].numel() * t.element_size()
+            self.segments.append((offset, t.shape[1:], t.dtype, nbytes))
+            offset = (offset + nbytes + 255) & ~255
+        self.slab_size = (offset + 4095) & ~4095
+        self.max_slots = max_slots
+        self.slots = {}
+        self.arena = PinnedArena(max_slots * self.slab_size, "CPU page cache (TP rank)")
+
+
+    def close(self):
+        """
+        Drop the slot views and return the arena to the OS
+        """
+        self.slots = {}
+        if self.arena is not None:
+            self.arena.close()
+            self.arena = None
+
+
+    def get(self, slot: int):
+        buffers = self.slots.get(slot)
+        if buffers is None:
+            assert 0 <= slot < self.max_slots
+            base = slot * self.slab_size
+            buffers = self.slots[slot] = [
+                self.arena.tensor[base + offset : base + offset + nbytes].view(dtype).view(shape)
+                for offset, shape, dtype, nbytes in self.segments
+            ]
+        return buffers
+
+
+def mp_cpu_cache_tensors(local_context: dict, cache_ids: list[int]):
+    cache_tensors = []
+    for cache_id in cache_ids:
+        for module in local_context["kv_modules"]:
+            cache_tensors += [t for t in module.tp_cache_lookup[cache_id].get_tensors() if t is not None]
+    return cache_tensors
+
+
+def mp_cpu_cache_init(local_context: dict, cache_ids: list[int], max_slots: int):
+    """
+    Size of one page of this rank's cache shard in bytes, and the slot pool to hold those pages. Called with
+    max_slots = 0 to size the slot before the main process knows how many will fit.
+    """
+    cache_tensors = mp_cpu_cache_tensors(local_context, cache_ids)
+    if max_slots:
+        # One pool per rank: a new Generator's tier replaces the previous Generator's
+        if local_context.get("cpu_page_cache") is not None:
+            local_context["cpu_page_cache"].close()
+        local_context["cpu_page_cache"] = RankSlotPool(cache_tensors, max_slots)
+    return sum(t[0].numel() * t.element_size() for t in cache_tensors)
+
+
+def mp_cpu_cache_store(local_context: dict, cache_ids: list[int], slot: int, page_index: int):
+    """
+    Copy this rank's shard of a page into the buffers held for slot (device-to-host, async on the current
+    stream). Reusing a slot overwrites it in place, which is how the main process recycles an evicted entry.
+    """
+    pool = local_context["cpu_page_cache"]
+    buffers = pool.get(slot)
+    for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
+        buffer.copy_(tensor[page_index], non_blocking = True)
+
+
+def mp_cpu_cache_fetch(local_context: dict, cache_ids: list[int], slot: int, page_index: int):
+    """
+    Copy a stored page back into this rank's shard of a page slot (host-to-device, async on the current stream)
+    """
+    buffers = local_context["cpu_page_cache"].slots[slot]
+    for buffer, tensor in zip(buffers, mp_cpu_cache_tensors(local_context, cache_ids)):
+        tensor[page_index].copy_(buffer, non_blocking = True)
+
+
 class PseudoParentConn:
     """
     Standin for a Pipe to dispatch functions on the main device rather than a dedicated child process running
@@ -450,6 +561,10 @@ class PseudoParentConn:
 
     def close(self, *args, **kwargs):
         self.local_context["inf_consumer"].close()
+        # This rank lives in the main process, so nothing else returns its arena on unload
+        if self.local_context.get("cpu_page_cache") is not None:
+            self.local_context["cpu_page_cache"].close()
+            self.local_context["cpu_page_cache"] = None
         self.local_context = {}
         log_tp(self.device, f"Pseudoprocess closed")
 

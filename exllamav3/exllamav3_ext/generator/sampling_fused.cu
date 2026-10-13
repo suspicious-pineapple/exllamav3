@@ -45,6 +45,17 @@ inline __device__ float fs_gumbel(float x)
 inline __device__ float fs_to_float(half x) { return __half2float(x); }
 inline __device__ float fs_to_float(float x) { return x; }
 
+// Apply the optional additive half mask or packed bitmask (bit clear = token masked out) to one
+// logit. At most one of row_mask/row_bits is non-null.
+inline __device__ float fs_mask(float x, const half* row_mask, const uint32_t* row_bits, int i)
+{
+    if (row_mask)
+        x += fs_to_float(row_mask[i]);
+    else if (row_bits && !((row_bits[i >> 5] >> (i & 31)) & 1))
+        x = FS_NEG_INF;
+    return x;
+}
+
 // Argmax reduction preferring the lowest index among equal values, so the block/grid split
 // cannot change which of two tied logits wins (and greedy mode matches a sequential scan)
 
@@ -116,22 +127,25 @@ void fs_partial_max_kernel
 (
     const T* __restrict__ logits,               // (bsz, dim)
     const half* __restrict__ mask,              // (1 or bsz, >= size) or nullptr
+    const uint32_t* __restrict__ bits,          // (1 or bsz, bits_words) or nullptr
     float* __restrict__ ws_max,                 // (bsz, num_blocks)
     const int dim,
     const int size,
     const int num_blocks,
-    const bool mask_per_row
+    const bool mask_per_row,
+    const int bits_words
 )
 {
     int row = blockIdx.y;
     const T* row_logits = logits + (size_t) row * dim;
     const half* row_mask = mask ? mask + (mask_per_row ? (size_t) row * dim : 0) : nullptr;
+    const uint32_t* row_bits = bits ? bits + (mask_per_row ? (size_t) row * bits_words : 0) : nullptr;
 
     float m = FS_NEG_INF;
     for (int i = blockIdx.x * FS_THREADS + threadIdx.x; i < size; i += num_blocks * FS_THREADS)
     {
         float x = fs_to_float(row_logits[i]);
-        if (row_mask) x += fs_to_float(row_mask[i]);
+        x = fs_mask(x, row_mask, row_bits, i);
         m = fmaxf(m, x);
     }
     m = fs_block_reduce_max(m);
@@ -155,8 +169,10 @@ void fs_partial_max_kernel
 // resolves the exact threshold. Top-K refines first, because top-P's target is p times the
 // mass of the top-K-truncated set; the exact target then locates the top-P crossing either
 // inside the already-refined bucket or in an earlier bucket, which gets its own refinement
-// round. The crossing sub-bucket is dropped, matching the eager rule that the token crossing
-// the cumulative sum is dropped; tokens tied at the exact cutoff are all kept.
+// round. For top-P the crossing sub-bucket is dropped, matching the eager rule that the token
+// crossing the cumulative sum is dropped (here together with its exact ties); for top-K the
+// tokens tied at the exact cutoff are all kept, except that a cutoff inside the clamped tail
+// drops the tail.
 
 #define FS_HIST_RANGE 32.0f
 #define FS_MASS_SCALE 1099511627776.0f  // 2^40
@@ -208,12 +224,14 @@ void fs_histogram_kernel
 (
     const T* __restrict__ logits,               // (bsz, dim)
     const half* __restrict__ mask,              // (1 or bsz, >= size) or nullptr
+    const uint32_t* __restrict__ bits,          // (1 or bsz, bits_words) or nullptr
     const float* __restrict__ ws_max,           // (bsz, num_blocks) partial maxes
     uint8_t* __restrict__ hist,                 // FUSED_SAMPLER_HIST_STRIDE per row, zeroed
     const int dim,
     const int size,
     const int num_blocks,
     const bool mask_per_row,
+    const int bits_words,
     const int filters,
     const float minp_log,
     const float inv_temp_filter
@@ -222,6 +240,7 @@ void fs_histogram_kernel
     int row = blockIdx.y;
     const T* row_logits = logits + (size_t) row * dim;
     const half* row_mask = mask ? mask + (mask_per_row ? (size_t) row * dim : 0) : nullptr;
+    const uint32_t* row_bits = bits ? bits + (mask_per_row ? (size_t) row * bits_words : 0) : nullptr;
 
     float m = FS_NEG_INF;
     for (int j = threadIdx.x; j < num_blocks; j += FS_THREADS)
@@ -251,7 +270,7 @@ void fs_histogram_kernel
     for (int i = blockIdx.x * FS_THREADS + threadIdx.x; i < size; i += num_blocks * FS_THREADS)
     {
         float x = fs_to_float(row_logits[i]);
-        if (row_mask) x += fs_to_float(row_mask[i]);
+        x = fs_mask(x, row_mask, row_bits, i);
         if (x < minp_threshold || x == FS_NEG_INF) continue;
         int b, s;
         fs_bin(x, m, bucket_scale, b, s);
@@ -280,11 +299,13 @@ void fs_histogram_refine_kernel
 (
     const T* __restrict__ logits,
     const half* __restrict__ mask,
+    const uint32_t* __restrict__ bits,
     uint8_t* __restrict__ hist,
     const int dim,
     const int size,
     const int num_blocks,
     const bool mask_per_row,
+    const int bits_words,
     const int filters,
     const float minp_log,
     const float inv_temp_filter
@@ -298,6 +319,7 @@ void fs_histogram_refine_kernel
 
     const T* row_logits = logits + (size_t) row * dim;
     const half* row_mask = mask ? mask + (mask_per_row ? (size_t) row * dim : 0) : nullptr;
+    const uint32_t* row_bits = bits ? bits + (mask_per_row ? (size_t) row * bits_words : 0) : nullptr;
 
     __shared__ unsigned int sh_cnt[FS_NB];
     __shared__ unsigned long long sh_mass[FS_NB];
@@ -314,7 +336,7 @@ void fs_histogram_refine_kernel
     for (int i = blockIdx.x * FS_THREADS + threadIdx.x; i < size; i += num_blocks * FS_THREADS)
     {
         float x = fs_to_float(row_logits[i]);
-        if (row_mask) x += fs_to_float(row_mask[i]);
+        x = fs_mask(x, row_mask, row_bits, i);
         if (x < minp_threshold || x == FS_NEG_INF) continue;
         int b, s;
         fs_bin(x, m, bucket_scale, b, s);
@@ -464,8 +486,9 @@ void fs_select_kernel
         fs_scan_1024(fs_hist_count(hist, row, 0), fs_hist_mass(hist, row, 0), sh_c, sh_ms, cum_c, cum_m);
         unsigned long long total = cum_m[FS_NB - 1];
 
-        // Top-K boundary bucket: binding only if the count crosses k before the last bucket
-        // (the last bucket also holds the clamped tail, so a crossing there keeps everything)
+        // Top-K boundary bucket. A crossing in the last bucket is refined like any other: the
+        // refinement separates the bucket's in-range elements, and the clamped tail lands in its
+        // last sub-bucket, which the refined select drops
         int b_k = FS_NB;
         if (filters & FUSED_SAMPLER_F_TOPK)
         {
@@ -482,7 +505,7 @@ void fs_select_kernel
             __syncthreads();
             b_k = sh_res;
         }
-        if (b_k < FS_NB - 1)
+        if (b_k < FS_NB)
         {
             // Refine the top-K bucket first; top-P needs the exact truncated mass
             if (t == 0)
@@ -545,8 +568,18 @@ void fs_select_kernel
         }
         __syncthreads();
         int s_k = sh_res;
-        unsigned long long kept_mass_rb = cum_m[s_k];
-        if (t == 0) bound_min(rb, s_k);
+
+        // A cutoff inside the clamped tail (the last sub-bucket of the last bucket: everything
+        // FS_HIST_RANGE nats or more below the max) drops the tail rather than keeping all of it.
+        // Those tokens have relative weight below e^-FS_HIST_RANGE at the filter temperature, and
+        // ordering them would take another pass, so the kept set then holds fewer than k tokens
+        bool drop_tail = rb == FS_NB - 1 && s_k == FS_NB - 1;
+        unsigned long long kept_mass_rb = drop_tail ? (s_k > 0 ? cum_m[s_k - 1] : 0) : cum_m[s_k];
+        if (t == 0)
+        {
+            if (drop_tail) bound_drop_crossing(rb, s_k);
+            else bound_min(rb, s_k);
+        }
 
         if (!(filters & FUSED_SAMPLER_F_TOPP))
         {
@@ -628,6 +661,7 @@ void fs_partial_argmax_kernel
 (
     const T* __restrict__ logits,               // (bsz, dim)
     const half* __restrict__ mask,              // (1 or bsz, >= size) or nullptr
+    const uint32_t* __restrict__ bits,          // (1 or bsz, bits_words) or nullptr
     const float* __restrict__ ws_max,           // (bsz, num_blocks), mode 2 only
     ValIdx* __restrict__ ws_vi,                 // (bsz, num_blocks)
     const uint8_t* __restrict__ hist,           // mode 3 only (selected kept-set bound)
@@ -635,6 +669,7 @@ void fs_partial_argmax_kernel
     const int size,
     const int num_blocks,
     const bool mask_per_row,
+    const int bits_words,
     const float inv_temp,
     const float minp_log,
     const int filters,
@@ -645,6 +680,7 @@ void fs_partial_argmax_kernel
     int row = blockIdx.y;
     const T* row_logits = logits + (size_t) row * dim;
     const half* row_mask = mask ? mask + (mask_per_row ? (size_t) row * dim : 0) : nullptr;
+    const uint32_t* row_bits = bits ? bits + (mask_per_row ? (size_t) row * bits_words : 0) : nullptr;
 
     float threshold = FS_NEG_INF;
     if constexpr (MODE == 2)
@@ -678,7 +714,7 @@ void fs_partial_argmax_kernel
     for (int i = blockIdx.x * FS_THREADS + threadIdx.x; i < size; i += num_blocks * FS_THREADS)
     {
         float x = fs_to_float(row_logits[i]);
-        if (row_mask) x += fs_to_float(row_mask[i]);
+        x = fs_mask(x, row_mask, row_bits, i);
 
         float v;
         if constexpr (MODE == 0)
@@ -748,6 +784,9 @@ void fused_sampler
 (
     const at::Tensor& logits,                   // (bsz, dim), half or float
     const c10::optional<at::Tensor>& logit_mask,// (1 or bsz, >= size), half, optional
+    const c10::optional<at::Tensor>& logit_bitmask,  // (1 or bsz, words), int32 packed bitmask
+                                                // (bit clear = masked out), words * 32 >= size,
+                                                // optional, mutually exclusive with logit_mask
     at::Tensor& out,                            // (bsz, 1), long
     at::Tensor& workspace,                      // >= bsz * FUSED_SAMPLER_MAX_BLOCKS * 3, float
     int size,                                   // effective vocab bound, <= dim
@@ -775,7 +814,8 @@ void fused_sampler
 
     int bsz = logits.size(0);
     int dim = logits.size(1);
-    TORCH_CHECK(size > 0 && size <= dim, "fused_sampler: invalid size bound");
+    TORCH_CHECK(size > 0, "fused_sampler: sampling over an empty vocabulary (size bound 0)");
+    TORCH_CHECK(size <= dim, "fused_sampler: invalid size bound");
     TORCH_CHECK(out.numel() == bsz, "fused_sampler: out must have bsz elements");
 
     const half* mask_ptr = nullptr;
@@ -792,6 +832,22 @@ void fused_sampler
         TORCH_CHECK(mask.size(0) == 1 || mask.size(1) == dim, "fused_sampler: per-row mask must match logits width");
         mask_ptr = (const half*) mask.data_ptr();
         mask_per_row = mask.size(0) == bsz;
+    }
+
+    const uint32_t* bits_ptr = nullptr;
+    int bits_words = 0;
+    if (logit_bitmask.has_value())
+    {
+        TORCH_CHECK(!mask_ptr, "fused_sampler: logit_mask and logit_bitmask are mutually exclusive");
+        const at::Tensor& bits = logit_bitmask.value();
+        TORCH_CHECK_DTYPE(bits, kInt);
+        TORCH_CHECK_DIM(bits, 2);
+        TORCH_CHECK(bits.is_contiguous(), "fused_sampler: bitmask must be contiguous");
+        TORCH_CHECK(bits.size(1) * 32 >= size, "fused_sampler: bitmask narrower than size bound");
+        TORCH_CHECK(bits.size(0) == 1 || bits.size(0) == bsz, "fused_sampler: bad bitmask batch dim");
+        bits_ptr = (const uint32_t*) bits.data_ptr();
+        bits_words = (int) bits.size(1);
+        mask_per_row = bits.size(0) == bsz;
     }
 
     int num_blocks = MIN(CEIL_DIVIDE(size, FS_THREADS * 4), FUSED_SAMPLER_MAX_BLOCKS);
@@ -813,35 +869,37 @@ void fused_sampler
         TORCH_CHECK(hist.numel() >= bsz * FUSED_SAMPLER_HIST_STRIDE, "fused_sampler: histogram too small");
         hist_ptr = (uint8_t*) hist.data_ptr();
         TORCH_CHECK(((uintptr_t) hist_ptr) % 8 == 0, "fused_sampler: histogram must be 8-byte aligned");
-        cuda_check(cudaMemsetAsync(hist_ptr, 0, (size_t) bsz * FUSED_SAMPLER_HIST_STRIDE, stream));
     }
+
+    if (!bsz) return;
+    if (hist_ptr) cuda_check(cudaMemsetAsync(hist_ptr, 0, (size_t) bsz * FUSED_SAMPLER_HIST_STRIDE, stream));
 
     dim3 grid(num_blocks, bsz);
 
     #define FS_ARGS(T) \
-        (const T*) logits.data_ptr(), mask_ptr, ws_max, ws_vi, hist_ptr, dim, size, num_blocks, \
-        mask_per_row, inv_temp, minp_log, filters, inv_temp_filter, random
+        (const T*) logits.data_ptr(), mask_ptr, bits_ptr, ws_max, ws_vi, hist_ptr, dim, size, num_blocks, \
+        mask_per_row, bits_words, inv_temp, minp_log, filters, inv_temp_filter, random
 
     if (mode >= 2)
     {
         if (is_half)
             fs_partial_max_kernel<half><<<grid, FS_THREADS, 0, stream>>>
-                ((const half*) logits.data_ptr(), mask_ptr, ws_max, dim, size, num_blocks, mask_per_row);
+                ((const half*) logits.data_ptr(), mask_ptr, bits_ptr, ws_max, dim, size, num_blocks, mask_per_row, bits_words);
         else
             fs_partial_max_kernel<float><<<grid, FS_THREADS, 0, stream>>>
-                ((const float*) logits.data_ptr(), mask_ptr, ws_max, dim, size, num_blocks, mask_per_row);
+                ((const float*) logits.data_ptr(), mask_ptr, bits_ptr, ws_max, dim, size, num_blocks, mask_per_row, bits_words);
     }
 
     if (mode == 3)
     {
         #define FS_HIST(T) \
             fs_histogram_kernel<T><<<grid, FS_THREADS, 0, stream>>> \
-                ((const T*) logits.data_ptr(), mask_ptr, ws_max, hist_ptr, dim, size, \
-                 num_blocks, mask_per_row, filters, minp_log, inv_temp_filter);
+                ((const T*) logits.data_ptr(), mask_ptr, bits_ptr, ws_max, hist_ptr, dim, size, \
+                 num_blocks, mask_per_row, bits_words, filters, minp_log, inv_temp_filter);
         #define FS_REFINE(T) \
             fs_histogram_refine_kernel<T><<<grid, FS_THREADS, 0, stream>>> \
-                ((const T*) logits.data_ptr(), mask_ptr, hist_ptr, dim, size, \
-                 num_blocks, mask_per_row, filters, minp_log, inv_temp_filter);
+                ((const T*) logits.data_ptr(), mask_ptr, bits_ptr, hist_ptr, dim, size, \
+                 num_blocks, mask_per_row, bits_words, filters, minp_log, inv_temp_filter);
         #define FS_SELECT(PHASE) \
             fs_select_kernel<<<bsz, FS_THREADS, 0, stream>>> \
                 (hist_ptr, PHASE, filters, top_k, top_p, minp_log, inv_temp_filter);
@@ -888,6 +946,92 @@ void fused_sampler
         (uint64_t*) out.data_ptr(),
         num_blocks
     );
+
+    cuda_check(cudaPeekAtLastError());
+}
+
+// Masked copy for the eager sampling path: out = bit set ? in : -inf. Replaces the dense
+// logits + logit_mask add when the mask arrives as a packed bitmask, without expanding the mask
+// on the host or sending a full-width tensor over PCIe. Out-of-place, preserving the raw logits
+// for the top-K/probs outputs like the eager add does. Indices at or beyond the bitmask width
+// are masked out, matching the -inf padding semantics of the half mask.
+
+namespace
+{
+
+inline __device__ void fs_store(half* p, float x) { *p = __float2half(x); }
+inline __device__ void fs_store(float* p, float x) { *p = x; }
+
+template <typename T>
+__global__ __launch_bounds__(FS_THREADS)
+void apply_logit_bitmask_kernel
+(
+    const T* __restrict__ in,                   // (bsz, dim)
+    T* __restrict__ out,                        // (bsz, dim)
+    const uint32_t* __restrict__ bits,          // (1 or bsz, bits_words)
+    const int dim,
+    const bool bits_per_row,
+    const int bits_words
+)
+{
+    int row = blockIdx.y;
+    const T* row_in = in + (size_t) row * dim;
+    T* row_out = out + (size_t) row * dim;
+    const uint32_t* row_bits = bits + (bits_per_row ? (size_t) row * bits_words : 0);
+
+    int nbits = bits_words * 32;
+    for (int i = blockIdx.x * FS_THREADS + threadIdx.x; i < dim; i += gridDim.x * FS_THREADS)
+    {
+        bool keep = i < nbits && ((row_bits[i >> 5] >> (i & 31)) & 1);
+        fs_store(&row_out[i], keep ? fs_to_float(row_in[i]) : FS_NEG_INF);
+    }
+}
+
+}  // namespace
+
+void apply_logit_bitmask
+(
+    const at::Tensor& logits_in,                // (bsz, dim), half or float
+    at::Tensor& logits_out,                     // (bsz, dim), same dtype
+    const at::Tensor& bitmask                   // (1 or bsz, words), int32 packed bitmask
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(logits_in.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DIM(logits_in, 2);
+    TORCH_CHECK(logits_in.is_contiguous(), "apply_logit_bitmask: logits must be contiguous");
+    TORCH_CHECK(logits_out.is_contiguous(), "apply_logit_bitmask: output must be contiguous");
+    TORCH_CHECK(logits_out.sizes() == logits_in.sizes(), "apply_logit_bitmask: shape mismatch");
+    TORCH_CHECK(logits_out.dtype() == logits_in.dtype(), "apply_logit_bitmask: dtype mismatch");
+    TORCH_CHECK_DTYPE(bitmask, kInt);
+    TORCH_CHECK_DIM(bitmask, 2);
+    TORCH_CHECK(bitmask.is_contiguous(), "apply_logit_bitmask: bitmask must be contiguous");
+
+    int bsz = logits_in.size(0);
+    int dim = logits_in.size(1);
+    TORCH_CHECK(bitmask.size(0) == 1 || bitmask.size(0) == bsz, "apply_logit_bitmask: bad bitmask batch dim");
+
+    bool is_half = logits_in.dtype() == at::kHalf;
+    bool is_float = logits_in.dtype() == at::kFloat;
+    TORCH_CHECK(is_half || is_float, "apply_logit_bitmask: logits must be half or float");
+    if (!bsz || !dim) return;
+
+    dim3 grid(MIN(CEIL_DIVIDE(dim, FS_THREADS * 4), FUSED_SAMPLER_MAX_BLOCKS), bsz);
+    if (is_half)
+        apply_logit_bitmask_kernel<half><<<grid, FS_THREADS, 0, stream>>>
+        (
+            (const half*) logits_in.data_ptr(), (half*) logits_out.data_ptr(),
+            (const uint32_t*) bitmask.data_ptr(), dim,
+            bitmask.size(0) == bsz, (int) bitmask.size(1)
+        );
+    else
+        apply_logit_bitmask_kernel<float><<<grid, FS_THREADS, 0, stream>>>
+        (
+            (const float*) logits_in.data_ptr(), (float*) logits_out.data_ptr(),
+            (const uint32_t*) bitmask.data_ptr(), dim,
+            bitmask.size(0) == bsz, (int) bitmask.size(1)
+        );
 
     cuda_check(cudaPeekAtLastError());
 }

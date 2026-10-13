@@ -61,8 +61,8 @@ void count_inf_nan_kernel
     uint64_cu numel
 )
 {
-    uint64_cu idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    uint64_cu max_idx = MIN(blockIdx.x * BLOCK_SIZE + BLOCK_SIZE, numel);
+    uint64_cu idx = (uint64_cu) blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    uint64_cu max_idx = MIN((uint64_cu) blockIdx.x * BLOCK_SIZE + BLOCK_SIZE, numel);
     uint64_cu thread_inf = 0;
     uint64_cu thread_nan = 0;
     for (; idx < max_idx; idx += NUM_THREADS)
@@ -98,8 +98,11 @@ void count_inf_nan
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK_DTYPE(y, kLong);
+    TORCH_CHECK(y.numel() >= 2, "count_inf_nan: y must hold two counters (inf, NaN)");
+    TORCH_CHECK(x.dtype() == at::kHalf || x.dtype() == at::kFloat, "Unsupported dtype");
 
     uint64_cu numel = x.numel();
+    if (!numel) return;
     uint64_cu num_blocks = CEIL_DIVIDE(numel, BLOCK_SIZE);
 
     if (x.dtype() == at::kHalf)
@@ -118,4 +121,5 @@ void count_inf_nan
         );
     else
         TORCH_CHECK(false, "Unsupported dtype");
+    cuda_check(cudaPeekAtLastError());
 }

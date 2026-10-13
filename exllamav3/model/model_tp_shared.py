@@ -4,6 +4,7 @@ import numpy as np
 from multiprocessing import shared_memory
 import uuid
 from .model_tp_cuda import cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_PORTABLE
+from ..util.shm import check_shm_capacity
 
 DEFAULT_BUFFER_SIZE = 2 * 1024 ** 3
 MAX_CACHE_PER_PROCESS = 4 * 1024**3
@@ -19,6 +20,27 @@ _torch_dtypes = {
     "torch.float64": torch.float64,
     "torch.bfloat16": torch.bfloat16,
 }
+
+def _cache_insert(owner: SMProducer | SMConsumer, cache_id: int, tensor: torch.Tensor):
+    """
+    Add a tensor to one side's CPU tensor cache, evicting the oldest entries to stay within the byte limit.
+
+    The producer and every consumer run this same rule over the same sequence of sizes, and a consumer only ever
+    sees a subset of what the producer cached, so a consumer never drops an entry the producer still believes is
+    cached. That relies on both sides ordering entries by their latest insert: an id the producer evicted and then
+    sends again goes to the back of the consumer's queue too, rather than keeping its old position.
+    """
+    cache = owner.cached_cpu_tensors
+    old = cache.pop(cache_id, None)
+    if old is not None:
+        owner.cache_size -= old.element_size() * old.numel()
+    nbytes = tensor.element_size() * tensor.numel()
+    while cache and owner.cache_size + nbytes > MAX_CACHE_PER_PROCESS:
+        evicted = cache.pop(next(iter(cache)))
+        owner.cache_size -= evicted.element_size() * evicted.numel()
+    cache[cache_id] = tensor
+    owner.cache_size += nbytes
+
 
 class SMProducer:
     def __init__(
@@ -37,6 +59,7 @@ class SMProducer:
         self.buffer_size = buffer_size
 
         # Create SHM handle and numpy buffer
+        check_shm_capacity(self.buffer_size, "The tensor-parallel shared arena")
         self.shm = shared_memory.SharedMemory(create = True, size = self.buffer_size, name = self.shm_name)
         self.buf = np.ndarray((self.buffer_size,), dtype = np.uint8, buffer = self.shm.buf)
         self.buf_is_pinned = False
@@ -106,9 +129,7 @@ class SMProducer:
                     "method": "cached",
                     "cache_id": cache_id,
                 }
-            while self.cache_size + nbytes > MAX_CACHE_PER_PROCESS:
-                self.cached_cpu_tensors.pop(next(iter(self.cached_cpu_tensors)))
-            self.cached_cpu_tensors[cache_id] = tensor
+            _cache_insert(self, cache_id, tensor)
             # print("caching send:", cache_id)
 
         # Data is now buffered in shared memory space, store metadata and offset
@@ -242,9 +263,7 @@ class SMConsumer:
             if cache_id is not None:
                 # print("caching recv:", cache_id)
                 assert not cuda, "Cannot share cached tensor for CUDA"
-                while self.cache_size + nbytes > MAX_CACHE_PER_PROCESS:
-                    self.cached_cpu_tensors.pop(next(iter(self.cached_cpu_tensors)))
-                self.cached_cpu_tensors[cache_id] = tensor.clone(memory_format = torch.contiguous_format)
+                _cache_insert(self, cache_id, tensor.clone(memory_format = torch.contiguous_format))
 
         # Slice before cloning
         if slice_dim is not None:

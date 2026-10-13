@@ -20,6 +20,7 @@ class GatedRMSNorm(Module):
         constant_bias: float = 0.0,
         groups: int = 1,
         gate_first: bool = False,
+        gate_activation: str = "silu",
     ):
         super().__init__(config, key, None)
         assert qmap is None, "No quant scheme for RMSNorm"
@@ -34,6 +35,10 @@ class GatedRMSNorm(Module):
         # row selected per group, and the gate applied before the norm: y = norm(x * silu(g)) * w
         self.groups = groups
         self.gate_first = gate_first
+        # "silu" (GDN/Mamba2) or "sigmoid" (KDA); sigmoid takes the fp32 torch path (norm,
+        # weight and gate all fp32, gate applied after the weighted norm, per the KDA reference)
+        self.gate_activation = gate_activation
+        assert gate_activation in ("silu", "sigmoid")
         self.bc = None
 
     @override
@@ -53,6 +58,7 @@ class GatedRMSNorm(Module):
             self.constant_bias,
             self.groups,
             self.gate_first,
+            1 if self.gate_activation == "sigmoid" else 0,
         )
 
     @override
@@ -66,25 +72,6 @@ class GatedRMSNorm(Module):
         return {
             f"{self.key}.weight": self.weight.data
         }
-
-    def forward_fla(
-        self,
-        x: torch.Tensor,
-        params: dict,
-        out_dtype: torch.dtype | None = None,
-        gate: torch.Tensor = None,
-    ) -> torch.Tensor:
-        from fla.modules.fused_norm_gate import rms_norm_gated
-        x = rms_norm_gated(
-            x = x,
-            g = gate,
-            weight = self.weight,
-            bias = None,
-            activation = "silu",
-            eps = self.rms_norm_eps
-        )
-        x = x.to(out_dtype or self.out_dtype)
-        return x
 
     def forward_torch(
         self,
@@ -121,8 +108,16 @@ class GatedRMSNorm(Module):
         out_dtype: torch.dtype | None = None,
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
+        gate_act = 1 if self.gate_activation == "sigmoid" else 0
+        if gate_act and not (x.dtype == torch.bfloat16 and x.is_contiguous() and gate.is_contiguous()):
+            # KDA torch fallback: strict-fp32 norm and weight, sigmoid gate after the norm
+            h = x.to(torch.float32)
+            h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim = True) + self.rms_norm_eps)
+            h = self.weight.to(torch.float32) * h
+            h = h * torch.sigmoid(gate.to(torch.float32))
+            return h.to(out_dtype or self.out_dtype or x.dtype)
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first)
+        ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first, gate_act)
         return y
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
@@ -147,6 +142,7 @@ class GatedRMSNorm(Module):
                 "constant_bias": self.constant_bias,
                 "groups": self.groups,
                 "gate_first": self.gate_first,
+                "gate_activation": self.gate_activation,
             },
             "weight": producer.send(self.weight),
             "device": self.device,
@@ -162,11 +158,12 @@ class GatedRMSNorm(Module):
         )
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
-        module.weight = nn.Parameter(w)
+        module.weight = nn.Parameter(w, requires_grad = False)
         # load() builds the BC alongside the weight; the TP import must too, or graphed consumers
         # (BC_GatedDeltaNetSplit holds norm.bc) get a null pointer
         module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
-                                        module.groups, module.gate_first)
+                                        module.groups, module.gate_first,
+                                        1 if module.gate_activation == "sigmoid" else 0)
         torch.cuda.synchronize()
         return module
 
@@ -188,8 +185,9 @@ class GatedRMSNorm(Module):
             # Per-channel weight (Mamba2 group norm): element range; the caller fixes up
             # module.groups to the local group count
             w = w[first : last]
-        module.weight = nn.Parameter(w.to(module.device).contiguous())
+        module.weight = nn.Parameter(w.to(module.device).contiguous(), requires_grad = False)
         module.bc = ext.BC_GatedRMSNorm(module.weight, module.rms_norm_eps, module.constant_bias,
-                                        module.groups, module.gate_first)
+                                        module.groups, module.gate_first,
+                                        1 if module.gate_activation == "sigmoid" else 0)
 
         return module
