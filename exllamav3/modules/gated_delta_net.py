@@ -603,6 +603,8 @@ class GatedDeltaNet(Module):
         self.key_f_b = key_f_b
         self.key_g_a = key_g_a
         self.key_g_b = key_g_b
+        self.ba_merged_w = None
+        self.ba_merged_b = None
 
         if self.num_k_heads == 0:
             return
@@ -938,7 +940,11 @@ class GatedDeltaNet(Module):
 
             # Sliced qkv+z bundle: both projections read x and are cut into equal-width column
             # slices run as one launch (SlicedMultiLinear); the graph object gets the tables, the
-            # eager path (m <= 32) uses them directly
+            # eager path (m <= 32) uses them directly. Kept inside the _bc_gdn_enable gate: on XPU
+            # the eager sliced path measured SLOWER than the two separate dense GEMMs for this
+            # width combo (gcd(8192, 4096) = 4096 cuts qkv into two extra-slim gemms, 3 oneMKL
+            # launches vs 2, 0.225 vs 0.193 ms/call), so the bundle only pays where the graph
+            # capture uses it
             self.multi_qkvz = None
             if (
                 _qkv_slice_enable and
@@ -960,6 +966,18 @@ class GatedDeltaNet(Module):
                 self.bc.set_qkvz_bundle(mq.ptrs_trellis, mq.ptrs_suh, mq.ptrs_svh, mq.meta, mq.K, bool(mq.mcg), bool(mq.mul1))
                 # fp32 outputs: the mgemm C argument carries the dtype and slice width only
                 self.prealloc_qkvz_carrier = g_tensor_cache.get(device, (mq.num_slices, 1, mq.width), torch.float, "qkvzc_1")
+                # Preallocated fp16 outputs (max bundle row count 32) with a c_ptrs table built
+                # once: the sliced gemm writes a col-major (n, m) output with the full-width
+                # leading dimension, which occupies the same first-m-rows memory for any
+                # m <= 32, so one buffer set serves every row count. The stable table also keeps
+                # the kernel's pointer-table cache (keyed on data_ptr) from serving stale output
+                # pointers when the allocator reuses a freed per-call table's address
+                self.prealloc_qkvz_out = g_tensor_cache.get(device, (1, 32, self.qkv_proj.out_features), torch.half, "qkvzo")
+                self.prealloc_z_out = g_tensor_cache.get(device, (1, 32, self.z_proj.out_features), torch.half, "qkvzz")
+                self.prealloc_qkvz_cptrs = mq.c_ptrs([
+                    self.prealloc_qkvz_out.view(32, -1),
+                    self.prealloc_z_out.view(32, -1),
+                ])
 
         is_quantized_kda = (
             _bc_gdn_enable and device != torch.device("cpu") and self.kda and
@@ -1048,6 +1066,12 @@ class GatedDeltaNet(Module):
         self.ba_weight_filled = False
         self.multi_qkvz = None
         self.prealloc_qkvz_carrier = None
+        self.prealloc_qkvz_out = None
+        self.prealloc_z_out = None
+        self.prealloc_qkvz_cptrs = None
+        self._qkvz_carrier_h = None
+        self.ba_merged_w = None
+        self.ba_merged_b = None
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -1137,7 +1161,7 @@ class GatedDeltaNet(Module):
             self.bc.set_stage_key(bsz, seqlen, True, id(rsl))
 
     def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
-        """qkv and z projections as one sliced mgemm (fp32 outputs, like the Linears); m <= 32"""
+        """qkv and z projections as one sliced mgemm into the preallocated fp16 outputs; m <= 32"""
         mq = self.multi_qkvz
         m = bsz * seqlen
         hidden = self.qkv_proj.in_features
@@ -1146,13 +1170,25 @@ class GatedDeltaNet(Module):
             x = torch.nn.functional.pad(x, (0, hidden - x.shape[-1]))
         x = x.contiguous().view(1, m, hidden)
         xh = torch.empty((mq.num_src, m, hidden), dtype = torch.half, device = x.device)
-        qkv = torch.empty((bsz, seqlen, self.qkv_proj.out_features), dtype = torch.float, device = x.device)
-        z = torch.empty((bsz, seqlen, self.z_proj.out_features), dtype = torch.float, device = x.device)
-        c_ptrs = mq.c_ptrs([qkv.view(m, -1), z.view(m, -1)])
+        # Preallocated outputs (built at load): the gemm writes the first m rows; the buffers are
+        # consumed within the layer's forward, before the next layer's call
+        qkv = self.prealloc_qkvz_out[:, :m]
+        z = self.prealloc_z_out[:, :m]
+        # The mgemm C argument only carries the dtype and slice width in sliced mode (the sliced
+        # kernel never writes it): fp16 when the bundle is dense (the dense sliced mode requires
+        # fp16), the fp32 prealloc otherwise
+        if mq.dense:
+            carrier = getattr(self, "_qkvz_carrier_h", None)
+            if carrier is None:
+                carrier = self._qkvz_carrier_h = torch.empty(
+                    (mq.num_slices, 1, mq.width), dtype = torch.half, device = x.device)
+            carrier = carrier.expand(mq.num_slices, m, mq.width)
+        else:
+            carrier = self.prealloc_qkvz_carrier.expand(mq.num_slices, m, mq.width)
         ext.exl3_mgemm(
             x,
             mq.ptrs_trellis,
-            self.prealloc_qkvz_carrier.expand(mq.num_slices, m, mq.width),
+            carrier,
             mq.ptrs_suh,
             xh,
             mq.ptrs_svh,
@@ -1167,11 +1203,15 @@ class GatedDeltaNet(Module):
             0,
             1,
             mq.size_n_list,
-            c_ptrs,
+            self.prealloc_qkvz_cptrs,
             mq.n_stride_list,
             mq.had_src_list,
             mq.num_src,
+            dense = mq.dense,
         )
+        # The gated norm's gate must be fp32/bf16 — the kernel's non-fp32 gate branch reads bf16,
+        # so an fp16 z is lifted back to fp32 (one tiny elementwise kernel)
+        z = z.float()
         return qkv, z
 
 
@@ -1410,8 +1450,41 @@ class GatedDeltaNet(Module):
                 qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
                 z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
-            b = self.b_proj.forward(x, params)
-            a = self.a_proj.forward(x, params)
+            # Post load, merge the small unquantized b/a projections into one fp16 GEMV: both read
+            # x and their (2H, hidden) weights concatenate exactly (the weights concatenate along
+            # the output dim, like the conv1d merge). Decode-only: the merged output's two H-wide
+            # halves are contiguous single-row views only for one row; prefill keeps the calls
+            if bsz * seqlen == 1 and self.b_proj is not None and self.a_proj is not None:
+                if self.ba_merged_w is None:
+                    bp, ap = self.b_proj.inner, self.a_proj.inner
+                    no_tp = (bp.full_out_features in (None, bp.out_features) and
+                             ap.full_out_features in (None, ap.out_features))
+                    if no_tp and bp.quant_type == "fp16" and ap.quant_type == "fp16":
+                        # Weight layout is (in, out): the outputs concatenate along dim 1
+                        self.ba_merged_w = torch.cat([bp.get_weight_tensor(), ap.get_weight_tensor()], dim = 1)
+                        if bp.bias is None and ap.bias is None:
+                            self.ba_merged_b = None
+                        else:
+                            z16 = torch.zeros(self.num_v_heads, dtype = torch.half, device = x.device)
+                            self.ba_merged_b = torch.cat([
+                                bp.bias if bp.bias is not None else z16,
+                                ap.bias if ap.bias is not None else z16,
+                            ])
+                    else:
+                        self.ba_merged_w = False   # unsuitable: keep the separate calls
+                if self.ba_merged_w is not False:
+                    baf = torch.empty((1, 2 * self.num_v_heads), dtype = torch.float, device = x.device)
+                    ext.hgemm(x.view(1, -1), self.ba_merged_w, baf)
+                    if self.ba_merged_b is not None:
+                        baf += self.ba_merged_b.float()
+                    b = baf[:, :self.num_v_heads].view(bsz, seqlen, self.num_v_heads)
+                    a = baf[:, self.num_v_heads:].view(bsz, seqlen, self.num_v_heads)
+                else:
+                    b = self.b_proj.forward(x, params)
+                    a = self.a_proj.forward(x, params)
+            else:
+                b = self.b_proj.forward(x, params)
+                a = self.a_proj.forward(x, params)
 
             if _conv_token_major and bsz * seqlen > 32:
                 mixed_qkv, conv_token_major = qkv, True   # the decode kernel wants channel-major bf16

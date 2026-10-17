@@ -8,6 +8,7 @@ from ..model.config import Config
 from ..model.model_tp_alloc import TPAllocation
 from .module import Module
 from .linear import Linear
+from ..util.tensor import ptr_tensor
 from .rmsnorm import RMSNorm
 from ..ext import exllamav3_ext as ext
 from ..util.rope import RopeStyle, yarn_inv_freq
@@ -949,9 +950,9 @@ class DSV4Attention(Module):
             if max(ns) != ns[0]:
                 return None    # first output is the dtype/max-width carrier
             return dict(
-                trellis = torch.tensor([i.trellis.data_ptr() for i in inner], dtype = torch.long, device = device),
-                suh = torch.tensor([i.suh.data_ptr() for i in inner], dtype = torch.long, device = device),
-                svh = torch.tensor([i.svh.data_ptr() for i in inner], dtype = torch.long, device = device),
+                trellis = ptr_tensor([i.trellis.data_ptr() for i in inner], device),
+                suh = ptr_tensor([i.suh.data_ptr() for i in inner], device),
+                svh = ptr_tensor([i.svh.data_ptr() for i in inner], device),
                 n = torch.tensor(ns, dtype = torch.int32, device = device),
                 idx = torch.arange(len(lins), dtype = torch.long, device = device).unsqueeze(0),
                 ns = ns, K = inner[0].K, mcg = inner[0].mcg, mul1 = inner[0].mul1,
@@ -999,7 +1000,7 @@ class DSV4Attention(Module):
             device = torch.device(self.device)
             outs = [g_tensor_cache.get(device, (seq,) + sh, torch.half, f"dsv4_fan_{tag}{i}")
                     for i, sh in enumerate(shapes)]
-            cptr = torch.tensor([o.data_ptr() for o in outs], dtype = torch.long, device = device)
+            cptr = ptr_tensor([o.data_ptr() for o in outs], device)
             ahad = g_tensor_cache.get(device, (len(outs), seq, self.hidden_size if tag == "x"
                                                else self.q_a.out_features),
                                       torch.half, f"dsv4_fan_{tag}_ah")

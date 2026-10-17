@@ -67,7 +67,11 @@ class DeviceAutotune(triton.KernelInterface):
                     idx = a.device.index
                     break
         if idx is None:
-            idx = torch.cuda.current_device()
+            # No tensor args: default to device 0 of whatever backend is active
+            try:
+                idx = torch.cuda.current_device()
+            except Exception:
+                idx = 0
         kind = device_kind(idx)
         tuner = self._tuners.get(kind.key)
         if tuner is None:
@@ -152,12 +156,21 @@ class DeviceKind:
     """What a kernel's autotune config list may depend on, for one device index. Devices with
     the same name and capability share a kind and so a tuner"""
     def __init__(self, idx: int):
-        p = torch.cuda.get_device_properties(idx)
-        self.key = (p.name, p.major, p.minor)
-        self.major, self.minor = p.major, p.minor
+        if IS_NVIDIA:
+            p = torch.cuda.get_device_properties(idx)
+            self.key = (p.name, p.major, p.minor)
+            self.major, self.minor = p.major, p.minor
+        elif getattr(torch, "xpu", None) and torch.xpu.is_available():
+            # XPU (Intel SYCL): no CUDA compute capability; the device name keys the tuner
+            p = torch.xpu.get_device_properties(idx)
+            self.key = ("xpu", p.name)
+            self.major = self.minor = 0
+        else:
+            self.key = ("cpu",)
+            self.major = self.minor = 0
         self.max_shared_mem = get_max_shared_mem(idx)
-        self.hopper = IS_NVIDIA and p.major == 9
-        self.blackwell = IS_NVIDIA and p.major in (10, 12)
+        self.hopper = IS_NVIDIA and self.major == 9
+        self.blackwell = IS_NVIDIA and self.major in (10, 12)
 
     def shared_mem(self, arch: str = "none") -> bool:
         """True if this device has at least the shared memory fla associates with `arch`
@@ -177,8 +190,12 @@ def input_guard(fn):
         args = [a.contiguous() if isinstance(a, torch.Tensor) else a for a in args]
         kwargs = {k: (v.contiguous() if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()}
         t = next((a for a in [*args, *kwargs.values()] if isinstance(a, torch.Tensor)), None)
-        if t is not None and t.device.index is not None:
+        if t is not None and t.device.index is not None and t.device.type == "cuda":
             ctx = torch.cuda.device(t.device.index)
+        elif t is not None and t.device.index is not None and t.device.type == "xpu" and \
+                getattr(torch, "xpu", None):
+            # Triton launches on the current XPU stream; the device context just pins the device
+            ctx = torch.xpu.device(t.device.index)
         else:
             ctx = contextlib.nullcontext()
         with ctx:

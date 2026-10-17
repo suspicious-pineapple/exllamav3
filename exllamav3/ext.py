@@ -6,6 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
+from .util.backend import XPU
 from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
@@ -15,6 +16,13 @@ ext_debug = False  # Compile with debug options
 # Determine if we're on Windows
 
 windows = (os.name == "nt")
+
+# XPU (Intel SYCL) defaults, set before any module that reads them: the graph-captured GDN decode
+# path and the fused sampler are CUDA-only on this backend, and the plain-python safetensors loader
+# replaces the C++ stloader
+if XPU:
+    os.environ.setdefault("EXL3_BC_GDN", "0")
+    os.environ.setdefault("EXL3_FUSED_SAMPLER", "0")
 
 # Determine if extension is already installed or needs to be built
 
@@ -27,7 +35,12 @@ def is_precompiled_extension_available():
         for suffix in importlib.machinery.EXTENSION_SUFFIXES
     )
 
-if is_precompiled_extension_available():
+if XPU and not torch.version.cuda and not torch.version.hip:
+    # Separate SYCL backend (module exllamav3_sycl_ext), built with icpx -fsycl; bound to the
+    # exllamav3_ext name the python surface imports
+    from .util.sycl_build import build_sycl_extension
+    exllamav3_ext = build_sycl_extension(verbose, ext_debug)
+elif is_precompiled_extension_available():
     import exllamav3_ext
 else:
 

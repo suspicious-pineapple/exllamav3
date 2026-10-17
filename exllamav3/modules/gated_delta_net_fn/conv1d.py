@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn.functional as F
 from ...util.tensor import get_for_device, buffered_arange
@@ -5,7 +7,9 @@ from ...ext import exllamav3_ext as ext
 
 # Above this length the triton kernel splits into separate output/state kernels and its launch
 # overhead is amortized anyway; the CUDA kernel keeps the conv window in registers per thread
-# so it only makes sense for short sequences (decode and SD verification steps)
+# so it only makes sense for short sequences (decode and SD verification steps). The SYCL backend
+# has the same single-launch port (sycl_causal_conv1d_update), bound under the cuda_ name --
+# on XPU the Triton path cost two launches plus Triton's Python dispatch per layer (48x/token)
 MAX_CUDA_SEQLEN = 32
 MAX_CUDA_K = 16
 
@@ -268,8 +272,8 @@ def causal_conv1d_update_slotted_triton(
     (bsz, dim, seq) layout; any float dtype (values are widened to fp32 in the kernel, so an
     fp16 projection needs no bf16 copy). out_dtype defaults to x's dtype.
     """
-    if not x.is_cuda:
-        raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
+    if x.device.type not in ("cuda", "xpu"):
+        raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA or XPU tensors")
     if not x.is_contiguous() or not conv_state.is_contiguous() or not weight.is_contiguous():
         raise RuntimeError("causal_conv1d_update_slotted_triton requires contiguous x, conv_state, and weight")
     if conv_state.device != x.device:
@@ -305,7 +309,13 @@ def causal_conv1d_update_slotted_triton(
     block_k = triton.next_power_of_2(conv_kernel_size)
     block_state = triton.next_power_of_2(state_size)
 
-    with torch.cuda.device(x.device):
+    # Triton launches on the current stream of the tensor's device; the CUDA device context is
+    # only needed (and only valid) on CUDA
+    if x.device.type == "cuda":
+        device_ctx = torch.cuda.device(x.device)
+    else:
+        device_ctx = contextlib.nullcontext()
+    with device_ctx:
         if seq_len <= 256:
             block_s = triton.next_power_of_2(seq_len)
             grid = (bsz, triton.cdiv(dim, block_d))
@@ -427,7 +437,7 @@ def causal_conv1d_update(
 
     if (
         not token_major and
-        mixed_qkv.is_cuda and
+        (mixed_qkv.is_cuda or mixed_qkv.device.type == "xpu") and
         seqlen <= MAX_CUDA_SEQLEN and
         conv1d_weight.shape[-1] <= MAX_CUDA_K and
         mixed_qkv.dtype == torch.bfloat16 and

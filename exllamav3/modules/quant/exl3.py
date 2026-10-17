@@ -13,6 +13,72 @@ RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
+# Pre-dequantize each EXL3 linear's trellis into a persistent dense fp16 weight and run every
+# forward through had -> oneMKL gemm -> had instead of the decode-on-the-fly GEMV kernels. The
+# SYCL GEMV is compute/latency-bound at decode shapes (~1.1 ms per 2048x2048) while oneMKL runs
+# the same GEMM in ~0.05 ms, and the weights are static, so the dequant (one reconstruct launch
+# per linear) pays for itself immediately. Memory cost: out_features x in_features x 2 bytes per
+# linear (~4 GB for a 2B model). Engages on XPU only (EXL3_SYCL_DENSE=0 to disable)
+sycl_dense = os.environ.get("EXL3_SYCL_DENSE", "1") != "0"
+
+# Global budget for the dense weights: measured once (free VRAM at the first ensure_dense call,
+# which happens during the load warmup) minus a safety margin for cache/activation transients.
+# Each build subtracts its size, so the dense dequant never overcommits on models whose dense
+# form would not fit (they fall back to the packed paths, per linear)
+_dense_budget = None
+_DENSE_SAFETY = 1536 << 20  # 1.5 GiB
+
+def reset_dense_budget():
+    """Forget the measured dense-weight budget. Called on model unload: the unloaded model's
+    dense weights are freed, so a stale (exhausted) budget would keep every later model in
+    the process all-packed instead of re-measuring free VRAM for the next load."""
+    global _dense_budget
+    _dense_budget = None
+
+def _context_transient_bytes(config) -> int:
+    """Runtime transients that grow with the KV context (attention intermediates, the allocator's
+    working-set ratchet over the per-token buffers), estimated as a fraction of the KV cache at
+    the model's max context. A dense weight that consumes the headroom these need is what turns
+    a long generation into a shared-memory spill (a 5-10x decode cliff past ~1k tokens) once free
+    VRAM reaches zero. 0 when the geometry can't be read (the dense budget then keeps its base
+    safety margin only)."""
+    try:
+        d = getattr(config, "config_dict", None) or {}
+        t = d.get("text_config") or d
+        layers = t.get("num_hidden_layers")
+        kv_heads = t.get("num_key_value_heads")
+        head_dim = t.get("head_dim")
+        if head_dim is None:
+            head_dim = (t.get("hidden_size") or 0) // max(t.get("num_attention_heads") or 1, 1)
+        max_pos = t.get("max_position_embeddings")
+        if not (layers and kv_heads and head_dim and max_pos):
+            return 0
+        # Full-attention layers only; a hybrid model's recurrent layers keep no KV cache
+        layer_types = t.get("layer_types")
+        if layer_types:
+            n_full = sum(1 for lt in layer_types if lt == "full_attention")
+        else:
+            n_full = layers
+        kv_bytes = n_full * 2 * kv_heads * head_dim * 2 * max_pos
+        return kv_bytes // 4
+    except Exception:
+        return 0
+
+def _dense_safety(config) -> int:
+    return _DENSE_SAFETY + _context_transient_bytes(config)
+
+def _sycl_dense_ok(x: torch.device | None = None) -> bool:
+    if not sycl_dense:
+        return False
+    try:
+        if torch.version.cuda or torch.version.hip:
+            return False
+        if x is not None:
+            return x.type == "xpu"
+        return bool(getattr(torch, "xpu", None) and torch.xpu.is_available())
+    except Exception:
+        return False
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -78,6 +144,10 @@ class LinearEXL3:
         self.mul1_tensor = mul1
         self.mcg = self.mcg_tensor is not None
         self.mul1 = self.mul1_tensor is not None
+        self._dense_w = None
+        self._no_recon = None          # lazy: config.infer_params may not exist yet
+        self._dense_static_ok = None   # lazy: backend/dims memo for ensure_dense
+        self._dense_static_dev = None  # device the memo was computed for
         assert self.frac is None or self.mul1, f"{key}: half-integer bitrate {self.K} requires the mul1 codebook"
 
         self._fused_reconstruct = None
@@ -96,6 +166,11 @@ class LinearEXL3:
 
 
     def unload(self):
+        # Free the dense weight deterministically and forget the budget it consumed, so a model
+        # swap re-measures free VRAM for the next load instead of inheriting an exhausted budget
+        # NOTE: _dense_w is kept here on purpose — the driver-level free happens at model drop;
+        # dropping it during unload interacted badly with the autosplit loader's OOM fallback
+        reset_dense_budget()
         # g_tensor_cache.drop(*self.bsz1_xh_args)
         pass
 
@@ -134,14 +209,84 @@ class LinearEXL3:
         # and break CUDA-graph address stability)
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
 
-        reconstruct = params.get("reconstruct")
-        if not reconstruct:
+        # Never build the dense weight during the autosplit loader's measuring forwards: the
+        # loader reserves free VRAM for the weights it has yet to load, and a dense dequant
+        # here would consume it and fail the load mid-way
+        measure = params.get("autosplit_measure")
+
+        if not params.get("reconstruct"):
             rows = x.numel() // x.shape[-1]
-            if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
+            no_recon = self._no_recon
+            if no_recon is None:
+                no_recon = self._no_recon = self.config.infer_params.no_reconstruct
+            if rows <= AUTO_RECONSTRUCT_THRESHOLD or no_recon:
                 dtype = out_dtype or self.default_out_dtype
+                if not measure and self.ensure_dense(x.device):
+                    return self.dense_forward(x, out_dtype)
                 return self.bc.run_alloc(x, self.out_features, dtype == torch.float)
 
+        if not measure and self.ensure_dense(x.device):
+            return self.dense_forward(x, out_dtype)
+
         return self.reconstruct_hgemm(x, out_dtype)
+
+    def ensure_dense(self, device: torch.device | None = None) -> bool:
+        """Pre-dequantize the trellis into the persistent dense fp16 weight (XPU + EXL3_SYCL_DENSE
+        only). Returns False where the dense path does not apply (other backends, unsuitable dims,
+        or the global VRAM budget being exhausted, which falls back to the packed paths)."""
+        global _dense_budget
+        if self._dense_w is not None:
+            return True
+        # The backend/dims conditions never change per instance: memoized (this runs 373x/token
+        # through the decode forwards), re-computed if the weight device changes (a CPU swap
+        # would otherwise memoize False permanently). The VRAM budget stays dynamic.
+        dev = self.trellis.device
+        if self._dense_static_dev != dev:
+            self._dense_static_dev = dev
+            self._dense_static_ok = (
+                _sycl_dense_ok(dev) and
+                self.in_features % 128 == 0 and self.out_features % 128 == 0
+            )
+        if not self._dense_static_ok:
+            return False
+        nbytes = self.in_features * self.out_features * 2
+        if _dense_budget is None:
+            free, _ = torch.xpu.mem_get_info()
+            _dense_budget = free - _dense_safety(self.config)
+        if nbytes > _dense_budget:
+            return False
+        try:
+            w = torch.empty(
+                (self.in_features, self.out_features),
+                dtype = torch.half,
+                device = self.trellis.device,
+            )
+            ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+            self._dense_w = w
+        except torch.OutOfMemoryError:
+            _dense_budget = 0
+            return False
+        _dense_budget -= nbytes
+        return True
+
+    def dense_forward(self, x: torch.Tensor, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """had -> oneMKL gemm -> had over the pre-dequantized (rotated-basis) dense weight. The
+        same chain the packed GEMV and the non-fused prefill path implement."""
+        shape = x.shape
+        rows = x.numel() // shape[-1]
+        out_shape = shape[:-1] + (self.out_features,)
+        x2 = x.view(rows, self.in_features)
+        y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
+        y_ = y.view(rows, self.out_features)
+
+        xh = torch.empty_like(x2)
+        ext.had_r_128(x2, xh, self.suh, None, 1.0)
+        ext.hgemm_recon(xh, self._dense_w, y_)
+        ext.had_r_128(y_, y_, None, self.svh, 1.0)
+
+        if self.bias is not None:
+            y += self.bias
+        return y
 
 
     def unpack_bf(self, bitfield: torch.Tensor):

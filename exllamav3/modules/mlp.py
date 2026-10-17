@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from ..model.config import Config
+from ..util.backend import XPU
 from ..util.tensor import to2
 from . import Module, Linear
 from ..ext import exllamav3_ext as ext
@@ -308,6 +309,7 @@ class MLP(Module):
         self.bc = None
         if (
             device != torch.device("cpu") and
+            not XPU and
             self.num_slices == 1 and
             self.activation_fn in ("silu", "gelu", "relu2") and
             self.interm_dtype in (None, torch.half) and
@@ -779,7 +781,7 @@ class GatedMLP(Module):
         # calls (the unfused configuration the int8-activation GEMV mode prefers)
         # (not with interm_div: the graph has no hook for the pre-activation rescale)
         self.bc = None
-        if self.num_slices == 1 and self.interm_div == 1.0 and self.downs[0].inner.bc is not None:
+        if self.num_slices == 1 and self.interm_div == 1.0 and not XPU and self.downs[0].inner.bc is not None:
             mgu = self.multi_gu[0]
             g0, u0 = self.gates[0], self.ups[0]
             can_separate = (
@@ -908,7 +910,8 @@ class GatedMLP(Module):
                         -1,
                         -1,
                         0,
-                        1, None, None)
+                        1, None, None,
+                        dense = self.multi_gu[s].dense)
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 

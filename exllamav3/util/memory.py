@@ -5,6 +5,8 @@ import gc
 import sys
 from pydantic import PydanticUserError
 
+from ..ext import exllamav3_ext as ext
+
 # @lru_cache
 # def init_pynvml():
 #     pynvml.nvmlInit()
@@ -25,12 +27,28 @@ def touch_device_measure_vram(local_context: dict):
 
 def is_integrated_device(device) -> bool:
     """True for GPUs that share system memory with the host (e.g. GB10, Jetson)"""
+    if _is_xpu_device(device):
+        return bool(torch.xpu.get_device_properties(device).is_integrated_gpu)
     return bool(torch.cuda.get_device_properties(device).is_integrated)
+
+
+def _is_xpu_device(device) -> bool:
+    """True when device refers to an XPU (SYCL) device"""
+    try:
+        return torch.device(device).type == "xpu"
+    except (TypeError, ValueError, RuntimeError):
+        return False
 
 
 def device_mem_info(device) -> tuple[int, int]:
     """(free, total) bytes for device. On an integrated GPU, CUDA's free figure is the host's
     MemFree, which leaves out reclaimable page cache, so use MemAvailable instead"""
+    if _is_xpu_device(device):
+        free, total = ext.device_get_mem_info(device if isinstance(device, int) else 0)
+        if not free:
+            # free_memory query unsupported: approximate with the caching allocator
+            free = max(total - torch.xpu.memory_reserved(device), 0)
+        return free, total
     free, total = torch.cuda.mem_get_info(device)
     if is_integrated_device(device):
         available = host_memory_available()
@@ -46,6 +64,9 @@ def set_memory_fraction_reserve(
 ):
     touch_device(device)
     free, total = device_mem_info(device)
+    if _is_xpu_device(device):
+        # No per-process fraction API on XPU; the budget is just the unreserved headroom
+        return int(max(free - reserve, 0))
     # mem_get_info reports memory free *after* whatever this process has already reserved, but
     # set_per_process_memory_fraction limits the process's *cumulative* reserved bytes. Add the
     # current reservation back, or memory held by an earlier load in the same process (a draft
@@ -68,6 +89,9 @@ def set_memory_fraction_use(
     device: int
 ):
     touch_device(device)
+    if _is_xpu_device(device):
+        free, total = device_mem_info(device)
+        return int(min(use, free))
     total = torch.cuda.get_device_properties(device).total_memory
     current = torch.cuda.memory_reserved(device)
     # The budget cannot exceed what the device can still give: a split value at or above the
@@ -82,6 +106,8 @@ def set_memory_fraction_use(
 
 # Un-reserve VRAM
 def unset_memory_fraction(active_devices: list[int]):
+    if _is_xpu_device(active_devices[0]) if active_devices else False:
+        return
     for i in active_devices:
         torch.cuda.set_per_process_memory_fraction(1.0, device = i)
 
@@ -102,7 +128,10 @@ class gc_paused:
 # Free unused VRAM
 def free_mem():
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.xpu.is_available():
+        torch.xpu.empty_cache()
 
 
 # Host-allocation churn (recurrent checkpoint stashes, per-layer fp32 copies during

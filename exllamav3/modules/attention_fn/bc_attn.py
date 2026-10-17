@@ -758,6 +758,12 @@ def build_bc_attn(module, layer):
     is not supported (caller falls back to the dispatch path)."""
     from ...cache import CacheLayer_quant, CacheLayer_fp16
     from ...cache.qsa import QSAPlanes
+    from ...util.backend import XPU
+
+    if XPU:
+        # CUDA graphs are off on the SYCL backend; the decode path always runs the dispatch
+        _trace_build(module, None, "attn")
+        return None
 
     m = module
     qsa_idx = getattr(m, "qsa_indexer", None)

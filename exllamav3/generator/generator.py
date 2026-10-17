@@ -1551,13 +1551,16 @@ class Generator:
                 token_logits = batch_logits[a:b, :, :]
                 sampled = job.receive_logits(token_logits)
                 next_token = sampled[0]
-                if next_token.is_cuda and next_token.numel() == 1:
+                if (next_token.is_cuda or next_token.is_xpu) and next_token.numel() == 1:
                     k = len(launched)
                     pinned[k:k + 1].copy_(next_token.view(1, 1), non_blocking = True)
                     sampled = (pinned[k:k + 1],) + sampled[1:]
                 launched.append((job, token_logits, sampled))
             if launched:
-                torch.cuda.synchronize(batch_logits.device)
+                if batch_logits.device.type == "xpu":
+                    torch.xpu.synchronize(batch_logits.device)
+                else:
+                    torch.cuda.synchronize(batch_logits.device)
                 # The sampled tokens are the next forward's inputs
                 self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 

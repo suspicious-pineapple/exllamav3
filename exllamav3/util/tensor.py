@@ -171,6 +171,16 @@ def buffered_arange(r: int, device: torch.device):
         buffered_aranges[r] = torch.arange(r)
     return get_for_device(buffered_aranges, r, device)
 
+def ptr_tensor(ptrs, device: torch.device | None = None):
+    """Pointer table from device data pointers. XPU (SYCL) allocations live above 2^63, so the
+    values are stored as two's-complement int64 (the C++ side casts back to uintptr_t, which
+    preserves the bit pattern)."""
+    vals = [p - (1 << 64) if p >= (1 << 63) else p for p in ptrs]
+    t = torch.tensor(vals, dtype = torch.long)
+    if device is not None:
+        t = t.to(device)
+    return t
+
 def buffered_interleaved_arange(r: int, k: int, device: torch.device):
     if (r, k) not in buffered_aranges:
         buffered_aranges[(r, k)] = torch.arange(r).repeat_interleave(k)

@@ -39,13 +39,18 @@ _fns_qc: list[AttnFn] = [
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
-attn_fns: list[AttnFn] = _fns_triton_fast + [
+# On XPU (SYCL) the Triton, xformers and bighead-scalar backends are CUDA-only; the dispatch
+# runs the pure-torch SDPA fallbacks exclusively
+from ...util.backend import XPU
+
+attn_fns: list[AttnFn] = ([] if XPU else _fns_triton_fast) + ([] if XPU else [
     fn_triton_attn_nocache,
     fn_triton_paged_attn,
     fn_triton_paged_attn_longq,
     fn_bighead_scalar_attn,
     fn_xformers_cutlass_fallback_cache,
     fn_xformers_cutlass_fallback_nocache,
+]) + [
     fn_torch_sdpa_fallback_cache,
     fn_torch_sdpa_fallback_nocache
 ]
@@ -100,6 +105,8 @@ def attn_dispatch(
     dispatch_cache: dict | None = None,
     max_kv_len: int | None = None,
     staging_pages: int | None = None,
+    block_table_host: list | None = None,
+    cache_seqlens_host: list | None = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -158,6 +165,8 @@ def attn_dispatch(
         window_right = window_right,
         sink_key0 = sink_key0,
         staging_pages = staging_pages,
+        block_table_host = block_table_host,
+        cache_seqlens_host = cache_seqlens_host,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache

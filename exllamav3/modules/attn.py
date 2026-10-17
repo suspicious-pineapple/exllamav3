@@ -640,7 +640,14 @@ class Attention(Module):
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
 
-        if self.multi_qkv is not None and bsz * q_len <= 32:
+        # Sliced bundle at decode only (m == 1, which uses the prealloc'd output buffers and a
+        # c_ptrs table built once). Prefill (m <= 32) builds a fresh c_ptrs table per call, and
+        # the kernel's pointer-table cache is keyed on the table's data_ptr: the allocator reuses
+        # the same freed block for every layer's same-size table, so layers 2+ would read stale
+        # output pointers from layer 1 and write into dead buffers (observed as intermittent
+        # short-prompt corruption). The separate linears are safe for prefill and one-shot per
+        # request, so the batching win is not worth the hazard
+        if self.multi_qkv is not None and bsz * q_len == 1:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
@@ -688,7 +695,8 @@ class Attention(Module):
                 -1,
                 -1,
                 0,
-                1, None, None)
+                1, None, None,
+                dense = self.multi_qg.dense)
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
@@ -722,7 +730,8 @@ class Attention(Module):
                 -1,
                 -1,
                 0,
-                1, None, None)
+                1, None, None,
+                dense = self.multi_kv.dense)
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
@@ -783,6 +792,7 @@ class Attention(Module):
             mq.n_stride_list,
             mq.had_src_list,
             mq.num_src,
+            dense = mq.dense,
         )
         if self.interleaved_gate:
             q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = x.device)
@@ -1099,6 +1109,16 @@ class Attention(Module):
             cache = self.tp_cache_lookup[cache]
         block_table = get_for_device(params, "block_table", self.device)
         cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
+        # Host copies of the block table and cache lengths, where the caller built them on the CPU
+        # (the generator's pinned staging buffers and the static batch_shape tables): the fallback
+        # attention paths read pages and lengths without syncing on the device tensors
+        block_table_host = cache_seqlens_host = None
+        bt_src = params.get("block_table")
+        cs_src = params.get("cache_seqlens")
+        if isinstance(bt_src, torch.Tensor) and bt_src.device.type == "cpu":
+            block_table_host = bt_src.tolist()
+        if isinstance(cs_src, torch.Tensor) and cs_src.device.type == "cpu":
+            cache_seqlens_host = cs_src.tolist()
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
@@ -1204,6 +1224,8 @@ class Attention(Module):
                 dispatch_cache = self.dispatch_cache,
                 max_kv_len = max_kv_len,
                 staging_pages = staging_pages,
+                block_table_host = block_table_host,
+                cache_seqlens_host = cache_seqlens_host,
             )
 
         if self.headwise_gate:

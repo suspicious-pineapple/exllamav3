@@ -11,6 +11,16 @@ from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
 
+
+def clear_ptr_table_cache():
+    """Drop the SYCL mgemm backend's cached host copies of the device pointer tables. Called on
+    model unload/load: the cache is keyed by allocation address, which the caching allocator
+    recycles across loads, so a stale entry would feed the previous model's pointers into the
+    kernel (garbage output). Guarded, so builds without the SYCL backend are unaffected."""
+    from ..ext import exllamav3_ext as ext
+    if hasattr(ext, "exl3_sycl_ptr_cache_clear"):
+        ext.exl3_sycl_ptr_cache_clear()
+
 class Model(Model_TPMixin, Model_LSMixin):
 
     def __init__(
@@ -454,6 +464,14 @@ class Model(Model_TPMixin, Model_LSMixin):
             cache = ref()
             if cache is not None:
                 cache.initialized = False
+        # The mgemm backend caches host copies of the device pointer tables by allocation
+        # address, which the caching allocator recycles across loads: drop them so a table of
+        # the next model can't be served a previous model's stale pointers
+        clear_ptr_table_cache()
+        # Re-measure the dense-weight budget for the next load: the unloaded model's dense
+        # weights are freed here, so a stale exhausted budget would keep later models packed
+        from ..modules.quant.exl3 import reset_dense_budget
+        reset_dense_budget()
 
 
     def load_gen(
@@ -591,6 +609,10 @@ class Model(Model_TPMixin, Model_LSMixin):
             assert max_output_size >= 1, "max_output_size must be positive"
             assert max_output_factor >= 1, "max_output_factor must be positive"
 
+            # Drop stale cached pointer tables before any new table is built: a previous
+            # model's entries must never be served to this load
+            clear_ptr_table_cache()
+
             # Load to single device
             if device is not None:
                 assert not bool(reserve_per_device) and not bool(use_per_device), \
@@ -606,7 +628,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                 upd = use_per_device is not None
                 assert not (rpd and upd), \
                     "Cannot specify both reserve_per_device or use_per_device."
-                num_devices = torch.cuda.device_count()
+                num_devices = torch.cuda.device_count() if torch.cuda.is_available() else \
+                    torch.xpu.device_count() if torch.xpu.is_available() else 0
 
                 if not upd:
                     if reserve_per_device is None:
@@ -708,6 +731,33 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.output_device = tp_output_device
 
             free_mem()
+
+            # Build the dense weights and switch the mgemm pointer tables to them, once, now that
+            # every weight is loaded: densifying during the load would consume the VRAM the loader
+            # reserved for the not-yet-loaded weights, and only here is the free-VRAM measurement
+            # the loader's dense budget is based on honest
+            from ..modules.multilinear import MultiLinear, SlicedMultiLinear
+            seen = set()
+
+            def _try_dense(o):
+                if id(o) in seen:
+                    return
+                seen.add(id(o))
+                if isinstance(o, (MultiLinear, SlicedMultiLinear)):
+                    o.try_dense()
+                    return
+                if isinstance(o, dict):
+                    for v in o.values():
+                        _try_dense(v)
+                elif isinstance(o, (list, tuple)):
+                    for v in o:
+                        _try_dense(v)
+                elif not isinstance(o, torch.Tensor):
+                    for v in vars(o).values() if hasattr(o, '__dict__') else {}:
+                        _try_dense(v)
+
+            for m in self.modules:
+                _try_dense(m)
 
             # Release all global shared tensors (refs still held by modules until model is unloaded)
             g_tensor_cache.drop_all()

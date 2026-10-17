@@ -12,6 +12,15 @@ import torch
 # True for a ROCm torch (HIP runtime); the C++ extension's USE_ROCM
 ROCM = bool(torch.version.hip)
 
+# True for an XPU torch (Intel SYCL runtime) on a machine with a visible device; the separate
+# SYCL C++ extension (exllamav3_sycl_ext). torch.version.cuda / hip are None there
+XPU = bool(
+    getattr(torch, "xpu", None)
+    and torch.xpu.is_available()
+    and not torch.version.cuda
+    and not torch.version.hip
+)
+
 _gfx_arch_cache = {}
 
 
@@ -85,8 +94,9 @@ _cc_cache = {}
 
 
 def compute_capability(device) -> tuple[int, int]:
-    """(major, minor) of a CUDA device; (0, 0) on ROCm, where the HIP major is a gfx generation"""
-    if ROCM:
+    """(major, minor) of a CUDA device; (0, 0) on ROCm, where the HIP major is a gfx generation, and on
+    XPU, where the SYCL runtime has no CUDA compute capability"""
+    if ROCM or XPU:
         return (0, 0)
     idx = device.index if isinstance(device, torch.device) else device
     if idx is None:

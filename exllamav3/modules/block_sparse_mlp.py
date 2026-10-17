@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from ..model.config import Config
 from ..util.device_copy import host_to_device
-from ..util.tensor import to2
+from ..util.tensor import to2, ptr_tensor
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
@@ -651,13 +651,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
             # Pointer lists for fused modes. Gateless experts reuse the up tables as gate
             # placeholders: valid memory for the (uniform) table loads, never dereferenced
-            u_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.ups])
-            u_suh_ptr = torch.tensor([l.inner.suh.data_ptr() for l in self.ups])
-            u_svh_ptr = torch.tensor([l.inner.svh.data_ptr() for l in self.ups])
+            u_trellis_ptr = ptr_tensor([l.inner.trellis.data_ptr() for l in self.ups])
+            u_suh_ptr = ptr_tensor([l.inner.suh.data_ptr() for l in self.ups])
+            u_svh_ptr = ptr_tensor([l.inner.svh.data_ptr() for l in self.ups])
             if self.gated:
-                g_trellis_ptr = torch.tensor([l.inner.trellis.data_ptr() for l in self.gates])
-                g_suh_ptr = torch.tensor([l.inner.suh.data_ptr() for l in self.gates])
-                g_svh_ptr = torch.tensor([l.inner.svh.data_ptr() for l in self.gates])
+                g_trellis_ptr = ptr_tensor([l.inner.trellis.data_ptr() for l in self.gates])
+                g_suh_ptr = ptr_tensor([l.inner.suh.data_ptr() for l in self.gates])
+                g_svh_ptr = ptr_tensor([l.inner.svh.data_ptr() for l in self.gates])
             else:
                 g_trellis_ptr, g_suh_ptr, g_svh_ptr = u_trellis_ptr, u_suh_ptr, u_svh_ptr
             gu_trellis_ptr = torch.stack((g_trellis_ptr, u_trellis_ptr), dim = 0).T.contiguous().to(self.device)
@@ -671,8 +671,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             def _bias_ptrs(ls):
                 if ls[0].inner.bias is None:
                     return None
-                return torch.tensor([l.inner.bias.data_ptr() for l in ls],
-                                    dtype = torch.long, device = device)
+                return ptr_tensor([l.inner.bias.data_ptr() for l in ls], device)
             gate_bias_ptrs = _bias_ptrs(self.gates) if self.gated else None
             up_bias_ptrs = _bias_ptrs(self.ups)
             down_bias_ptrs = _bias_ptrs(self.downs)

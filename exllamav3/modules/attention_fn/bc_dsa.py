@@ -5,7 +5,7 @@ from ...util.backend import DSA_MQA, DSA_N_SPLITS, DSA_SPLIT_WARPS
 
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
-from ...util.tensor import g_tensor_cache
+from ...util.tensor import g_tensor_cache, ptr_tensor
 from .bc_attn import _compile_kernel, BCKernelTooLarge
 from . import dsa_mqa
 from .dsa_triton import _dsa_attn_split_kernel, _dsa_attn_combine_kernel, _dsa_indexer_fewq_kernel
@@ -139,11 +139,11 @@ class BCDsa:
         if uniform:
             dev = self.device
             self.fan = dict(
-                trellis = torch.tensor([i.trellis.data_ptr() for i in fan_inner],
+                trellis = ptr_tensor([i.trellis.data_ptr() for i in fan_inner],
                                        dtype = torch.long, device = dev),
-                suh = torch.tensor([i.suh.data_ptr() for i in fan_inner],
+                suh = ptr_tensor([i.suh.data_ptr() for i in fan_inner],
                                    dtype = torch.long, device = dev),
-                svh = torch.tensor([i.svh.data_ptr() for i in fan_inner],
+                svh = ptr_tensor([i.svh.data_ptr() for i in fan_inner],
                                    dtype = torch.long, device = dev),
                 n = torch.tensor(self.fan_ns, dtype = torch.int32, device = dev),
                 idx = torch.arange(len(fan_lins), dtype = torch.long, device = dev).unsqueeze(0),
@@ -308,7 +308,7 @@ class BCDsa:
                 outs += [mgc_comp[0], mgc_comp[1]]
             if self.has_idx:
                 outs += [mgc_idx[0], mgc_idx[1]]
-            fan_c = torch.tensor([o.data_ptr() for o in outs], dtype = torch.long, device = dev)
+            fan_c = ptr_tensor([o.data_ptr() for o in outs], dev)
             fan_ah = st((len(outs), seq, self.hidden), torch.half, "bcd_fanah")
         self.bc.configure_slot(
             seq, regime, x_st, qa_st, qres_st, q_st, kv_st, xh_a, xh_b,
@@ -440,11 +440,11 @@ class BCDsaBatch:
             raise RuntimeError("x-side fan unavailable")
         dev = self.device
         self.fan = dict(
-            trellis = torch.tensor([i.trellis.data_ptr() for i in fan_inner],
+            trellis = ptr_tensor([i.trellis.data_ptr() for i in fan_inner],
                                    dtype = torch.long, device = dev),
-            suh = torch.tensor([i.suh.data_ptr() for i in fan_inner],
+            suh = ptr_tensor([i.suh.data_ptr() for i in fan_inner],
                                dtype = torch.long, device = dev),
-            svh = torch.tensor([i.svh.data_ptr() for i in fan_inner],
+            svh = ptr_tensor([i.svh.data_ptr() for i in fan_inner],
                                dtype = torch.long, device = dev),
             n = torch.tensor(self.fan_ns, dtype = torch.int32, device = dev),
             idx = torch.arange(len(fan_lins), dtype = torch.long, device = dev).unsqueeze(0),

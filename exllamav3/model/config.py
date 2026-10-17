@@ -2,7 +2,7 @@ from __future__ import annotations
 from abc import ABC
 import os, json
 import torch
-from ..util.backend import INT8_GEMV_MODE
+from ..util.backend import INT8_GEMV_MODE, XPU
 from dataclasses import dataclass
 from ..util.rope import RopeSettings, RopeStyle
 from ..loader import SafetensorsCollection
@@ -144,8 +144,10 @@ class Config(ABC):
             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
 
-        # Collect all .safetensors files in directory
-        self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())
+        # Collect all .safetensors files in directory. On XPU the plain-python loader replaces the
+        # C++ stloader (which only stages into CUDA pinned buffers)
+        default_load_method = "python" if XPU else None
+        self.stc = SafetensorsCollection(directory, kwargs.get("load_method") or default_load_method, self.get_tensor_name_fixes())
 
         # Standard params, vocab
         self.bos_token_id = self.read_cfg(int, ["bos_token_id", "text_config->bos_token_id"], None)

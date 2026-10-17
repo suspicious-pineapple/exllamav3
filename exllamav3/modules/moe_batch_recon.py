@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from ..ext import exllamav3_ext as ext
 from ..util.device_copy import host_to_device
+from ..util.tensor import ptr_tensor
 
 RECON_BATCH = max(1, int(os.environ.get("EXL3_MOE_RECON_BATCH", 16)))
 # Padded rows per group (B * cmax): bounds the gathered input / intermediate slabs
@@ -93,7 +94,7 @@ def _addr_table(t, device):
         assert t.dim() == 2 and t.is_contiguous()
         step = t.shape[1] * t.element_size()
         return t.data_ptr() + torch.arange(t.shape[0], dtype = torch.long, device = device) * step
-    return torch.tensor([x.data_ptr() for x in t], dtype = torch.long, device = device)
+    return ptr_tensor([x.data_ptr() for x in t], device)
 
 
 def _stacked(t):

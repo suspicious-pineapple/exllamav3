@@ -31,6 +31,10 @@ class AttnArgs(NamedTuple):
     sink_key0: bool = False         # sinks bias each segment's first key instead of adding a logit (MiMo-ViT)
     staging_pages: int | None = None    # pages the quantized-cache prefill staging scratch is sized to
                                         # (a per-layer constant: the pool, or QSA's bounded window)
+    block_table_host: list | None = None    # host copy of the block table (list of page-index rows); the
+                                            # fallback attention paths use it instead of syncing on the
+                                            # device tensor for page reads (CPU sources upload async)
+    cache_seqlens_host: list | None = None  # host copy of cache_seqlens (list of ints), same purpose
 
     def sanity_check(self):
         # Cache must be paged
